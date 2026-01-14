@@ -222,6 +222,11 @@ class SimulationWorker(QThread):
                 # Propagate to target z position
                 temp_tool.propagate_to(z_pos)
                 
+                # Debug: Check field statistics
+                field_max = np.max(np.abs(temp_tool.current_field)**2)
+                field_mean = np.mean(np.abs(temp_tool.current_field)**2)
+                print(f"  Hover field at z={z_pos*1e3:.1f}mm: max={field_max:.2e}, mean={field_mean:.2e}, tool.current_z={temp_tool.current_z*1e3:.1f}mm")
+                
                 # Store field for this z position
                 self.hover_fields[z_pos] = temp_tool.current_field.copy()
             
@@ -743,7 +748,36 @@ class BeamPropagationGUI(QMainWindow):
         
         self.tabs.addTab(self.gallery_tab, "Beam Images")
         
-        # Tab 5: Summary
+        # Tab 5: M² Measurement Images
+        self.m2_images_tab = QWidget()
+        m2_images_layout = QVBoxLayout(self.m2_images_tab)
+        
+        # Controls for M² images
+        m2_images_controls = QFrame()
+        m2_images_controls_layout = QHBoxLayout(m2_images_controls)
+        
+        m2_images_controls_layout.addWidget(QLabel("Display:"))
+        self.m2_images_display_combo = QComboBox()
+        self.m2_images_display_combo.addItems(["Intensity", "Phase", "Both"])
+        self.m2_images_display_combo.setCurrentText("Intensity")
+        self.m2_images_display_combo.currentTextChanged.connect(self.update_m2_images_gallery)
+        m2_images_controls_layout.addWidget(self.m2_images_display_combo)
+        
+        self.update_m2_images_button = QPushButton("Refresh M² Images")
+        self.update_m2_images_button.clicked.connect(self.update_m2_images_gallery)
+        m2_images_controls_layout.addWidget(self.update_m2_images_button)
+        
+        m2_images_controls_layout.addStretch()
+        
+        m2_images_layout.addWidget(m2_images_controls)
+        
+        # Canvas for M² images
+        self.m2_images_canvas = MplCanvas(self, width=12, height=10, dpi=100)
+        m2_images_layout.addWidget(self.m2_images_canvas)
+        
+        self.tabs.addTab(self.m2_images_tab, "M² Images")
+        
+        # Tab 6: Summary
         self.summary_tab = QWidget()
         summary_layout = QVBoxLayout(self.summary_tab)
         
@@ -898,6 +932,9 @@ class BeamPropagationGUI(QMainWindow):
         # Initialize beam gallery
         self.update_beam_gallery()
         
+        # Initialize M² images gallery
+        self.update_m2_images_gallery()
+        
         # Re-enable button
         self.run_button.setEnabled(True)
         self.progress_bar.setVisible(False)
@@ -916,16 +953,37 @@ class BeamPropagationGUI(QMainWindow):
         intensity_norm = intensity / np.max(intensity)
         phase = np.angle(field)
         
-        # Create figure
-        fig = Figure(figsize=(6, 3), dpi=100)
+        # Calculate beam width for cropping (FWHM ≈ 1.177 * w for Gaussian)
+        # Use 1/e² width and convert to FWHM
+        from Zernike import compute_beam_width
+        wx, wy = compute_beam_width(intensity, x, y)
+        
+        # Crop to 4× FWHM
+        fwhm_x = 1.177 * wx  # Convert 1/e² to FWHM
+        fwhm_y = 1.177 * wy
+        crop_x = 4 * fwhm_x
+        crop_y = 4 * fwhm_y
+        
+        # Find indices for cropping
+        x_mask = np.abs(x) <= crop_x / 2
+        y_mask = np.abs(y) <= crop_y / 2
+        
+        # Crop the arrays
+        x_crop = x[x_mask]
+        y_crop = y[y_mask]
+        intensity_crop = intensity_norm[np.ix_(y_mask, x_mask)]
+        phase_crop = phase[np.ix_(y_mask, x_mask)]
+        
+        # Create figure (larger size for better visibility)
+        fig = Figure(figsize=(10, 5), dpi=100)
         
         # Left: Intensity
         ax1 = fig.add_subplot(121)
-        X, Y = np.meshgrid(x, y)
+        X_crop, Y_crop = np.meshgrid(x_crop, y_crop)
         
-        im1 = ax1.imshow(intensity_norm, extent=[x[0]*1e3, x[-1]*1e3, y[0]*1e3, y[-1]*1e3],
-                        origin='lower', cmap='hot', aspect='equal', vmin=0, vmax=1)
-        ax1.contour(X*1e3, Y*1e3, intensity_norm, levels=[0.135], 
+        im1 = ax1.imshow(intensity_crop, extent=[x_crop[0]*1e3, x_crop[-1]*1e3, y_crop[0]*1e3, y_crop[-1]*1e3],
+                        origin='lower', cmap='plasma', aspect='equal', vmin=0.001, vmax=1)
+        ax1.contour(X_crop*1e3, Y_crop*1e3, intensity_crop, levels=[0.135], 
                    colors='cyan', linewidths=2, linestyles='--')
         ax1.set_xlabel('X (mm)', fontsize=7)
         ax1.set_ylabel('Y (mm)', fontsize=7)
@@ -939,11 +997,11 @@ class BeamPropagationGUI(QMainWindow):
         # Right: Phase
         ax2 = fig.add_subplot(122)
         
-        im2 = ax2.imshow(phase, extent=[x[0]*1e3, x[-1]*1e3, y[0]*1e3, y[-1]*1e3],
+        im2 = ax2.imshow(phase_crop, extent=[x_crop[0]*1e3, x_crop[-1]*1e3, y_crop[0]*1e3, y_crop[-1]*1e3],
                         origin='lower', cmap='twilight', aspect='equal',
                         vmin=-np.pi, vmax=np.pi)
         contour_levels = np.linspace(-np.pi, np.pi, 9)
-        ax2.contour(X*1e3, Y*1e3, phase, levels=contour_levels,
+        ax2.contour(X_crop*1e3, Y_crop*1e3, phase_crop, levels=contour_levels,
                    colors='white', linewidths=0.5, alpha=0.3)
         ax2.set_xlabel('X (mm)', fontsize=7)
         ax2.set_ylabel('Y (mm)', fontsize=7)
@@ -1364,13 +1422,17 @@ class BeamPropagationGUI(QMainWindow):
                 
                 surf = ax.plot_surface(X[::skip, ::skip]*1e3, Y[::skip, ::skip]*1e3, 
                                       intensity[::skip, ::skip],
-                                      cmap='hot', antialiased=True, alpha=0.9)
+                                      cmap='plasma', antialiased=True, alpha=0.9,
+                                      vmin=0.001, vmax=1)
                 
                 ax.set_xlabel('X (mm)', fontsize=10, weight='bold')
                 ax.set_ylabel('Y (mm)', fontsize=10, weight='bold')
                 ax.set_zlabel('Normalized Intensity', fontsize=10, weight='bold')
                 ax.set_title(f'Beam Profile at z={z_pos*1e3:.1f} mm', 
                            fontsize=12, weight='bold')
+                
+                # Set z limits to show more structure
+                ax.set_zlim(0.001, 1)
                 
                 # Add colorbar
                 self.profile_canvas.fig.colorbar(surf, ax=ax, shrink=0.5, aspect=5)
@@ -1382,9 +1444,13 @@ class BeamPropagationGUI(QMainWindow):
                 # 2D contour plot
                 ax = self.profile_canvas.fig.add_subplot(111)
                 
-                levels = np.linspace(0, 1, 21)
+                # Use more levels concentrated near the base to show structure
+                levels = np.concatenate([
+                    np.linspace(0.001, 0.1, 10),  # More detail in low intensity
+                    np.linspace(0.1, 1, 11)       # Normal spacing for high intensity
+                ])
                 contour = ax.contourf(X*1e3, Y*1e3, intensity, levels=levels, 
-                                     cmap='hot')
+                                     cmap='plasma', vmin=0.001, vmax=1)
                 
                 ax.set_xlabel('X (mm)', fontsize=11, weight='bold')
                 ax.set_ylabel('Y (mm)', fontsize=11, weight='bold')
@@ -1434,6 +1500,164 @@ class BeamPropagationGUI(QMainWindow):
             import traceback
             traceback.print_exc()
 
+
+    def update_m2_images_gallery(self):
+        """Update M² measurement images gallery showing all measurement positions"""
+        
+        if not hasattr(self, 'tool') or self.tool is None or self.m2_data is None:
+            return
+        
+        try:
+            # Get parameters
+            display_type = self.m2_images_display_combo.currentText()
+            
+            # Get M² measurement positions
+            z_positions = self.m2_data['z_array']
+            n_images = len(z_positions)
+            
+            # Clear canvas
+            self.m2_images_canvas.fig.clear()
+            
+            # Calculate grid layout based on number of images
+            if n_images <= 6:
+                nrows, ncols = 2, 3
+            elif n_images <= 9:
+                nrows, ncols = 3, 3
+            elif n_images <= 12:
+                nrows, ncols = 3, 4
+            elif n_images <= 16:
+                nrows, ncols = 4, 4
+            elif n_images <= 20:
+                nrows, ncols = 4, 5
+            elif n_images <= 25:
+                nrows, ncols = 5, 5
+            else:
+                nrows, ncols = 6, 5
+            
+            params = self.worker.params
+            
+            # Generate images for each M² measurement position
+            for idx, z_pos in enumerate(z_positions):
+                # Create fresh temp tool for this position
+                temp_tool = BeamPropagationTool(
+                    w0=params['w0'],
+                    wavelength=params['wavelength'],
+                    grid_size=params['grid_size'],
+                    physical_size=params['physical_size']
+                )
+                temp_tool.start_fresh(with_current_aberrations=False)
+                
+                # Apply aberrations if past that point
+                if z_pos >= params['z_aberration']:
+                    temp_tool.propagate_to(params['z_aberration'])
+                    
+                    if params['z22'] != 0:
+                        temp_tool.add_zernike_aberration(2, 2, params['z22'])
+                    if params['z2m2'] != 0:
+                        temp_tool.add_zernike_aberration(2, -2, params['z2m2'])
+                    if params['z31'] != 0:
+                        temp_tool.add_zernike_aberration(3, 1, params['z31'])
+                    if params['z3m1'] != 0:
+                        temp_tool.add_zernike_aberration(3, -1, params['z3m1'])
+                    
+                    if (params['z22'] != 0 or params['z2m2'] != 0 or 
+                        params['z31'] != 0 or params['z3m1'] != 0):
+                        temp_tool.apply_aberrations_at_current_position()
+                        temp_tool.clear_aberrations()
+                
+                # Apply correction if enabled and past corrector
+                if params['enable_correction'] and z_pos >= params['z_corrector']:
+                    temp_tool.propagate_to(params['z_corrector'])
+                    temp_tool.apply_cylindrical_pair_for_astigmatism_correction(
+                        f1=params['f1'],
+                        f2=params['f2'],
+                        spacing=params['spacing'],
+                        angle1_deg=params['angle1'],
+                        angle2_deg=params['angle2']
+                    )
+                
+                # Propagate to target z
+                temp_tool.propagate_to(z_pos)
+                field = temp_tool.current_field
+                
+                # Calculate intensity and phase
+                intensity = np.abs(field)**2
+                intensity_norm = intensity / np.max(intensity)
+                phase = np.angle(field)
+                
+                x = temp_tool.x
+                y = temp_tool.y
+                
+                # Get measured beam widths for this position
+                wx = self.m2_data['wx_array'][idx]
+                wy = self.m2_data['wy_array'][idx]
+                
+                # Crop to 4×FWHM
+                fwhm_x = 1.177 * wx
+                fwhm_y = 1.177 * wy
+                crop_x = 4 * fwhm_x
+                crop_y = 4 * fwhm_y
+                
+                # Find indices for cropping
+                x_mask = np.abs(x) <= crop_x / 2
+                y_mask = np.abs(y) <= crop_y / 2
+                
+                # Crop arrays
+                x_crop = x[x_mask]
+                y_crop = y[y_mask]
+                intensity_crop = intensity_norm[np.ix_(y_mask, x_mask)]
+                phase_crop = phase[np.ix_(y_mask, x_mask)]
+                extent_crop = [x_crop[0]*1e3, x_crop[-1]*1e3, y_crop[0]*1e3, y_crop[-1]*1e3]
+                
+                if display_type == "Both":
+                    # Show both intensity and phase side by side
+                    ax_int = self.m2_images_canvas.fig.add_subplot(nrows, ncols*2, idx*2 + 1)
+                    ax_phase = self.m2_images_canvas.fig.add_subplot(nrows, ncols*2, idx*2 + 2)
+                    
+                    # Intensity
+                    ax_int.imshow(intensity_crop, extent=extent_crop, origin='lower', 
+                                 cmap='plasma', aspect='equal', vmin=0.001, vmax=1)
+                    ax_int.set_title(f'z={z_pos*1e3:.0f}mm\nIntensity', fontsize=8)
+                    ax_int.axis('off')
+                    
+                    # Phase
+                    ax_phase.imshow(phase_crop, extent=extent_crop, origin='lower',
+                                   cmap='twilight', aspect='equal', vmin=-np.pi, vmax=np.pi)
+                    ax_phase.set_title(f'Phase', fontsize=8)
+                    ax_phase.axis('off')
+                    
+                elif display_type == "Intensity":
+                    ax = self.m2_images_canvas.fig.add_subplot(nrows, ncols, idx + 1)
+                    ax.imshow(intensity_crop, extent=extent_crop, origin='lower',
+                             cmap='plasma', aspect='equal', vmin=0.001, vmax=1)
+                    
+                    ax.set_title(f'z={z_pos*1e3:.0f}mm\nwx={wx*1e6:.0f}µm, wy={wy*1e6:.0f}µm', 
+                               fontsize=8)
+                    ax.set_xlabel('x (mm)', fontsize=7)
+                    ax.set_ylabel('y (mm)', fontsize=7)
+                    ax.tick_params(labelsize=6)
+                    
+                else:  # Phase
+                    ax = self.m2_images_canvas.fig.add_subplot(nrows, ncols, idx + 1)
+                    im = ax.imshow(phase_crop, extent=extent_crop, origin='lower',
+                                  cmap='twilight', aspect='equal', vmin=-np.pi, vmax=np.pi)
+                    ax.set_title(f'z={z_pos*1e3:.0f}mm\nwx={wx*1e6:.0f}µm, wy={wy*1e6:.0f}µm', 
+                               fontsize=8)
+                    ax.set_xlabel('x (mm)', fontsize=7)
+                    ax.set_ylabel('y (mm)', fontsize=7)
+                    ax.tick_params(labelsize=6)
+            
+            # Add main title
+            title_text = f'M² Measurement: {n_images} positions from z={z_positions[0]*1e3:.0f}mm to z={z_positions[-1]*1e3:.0f}mm'
+            self.m2_images_canvas.fig.suptitle(title_text, fontsize=12, weight='bold')
+            
+            self.m2_images_canvas.fig.tight_layout(rect=[0, 0, 1, 0.97])
+            self.m2_images_canvas.draw()
+            
+        except Exception as e:
+            print(f"Error updating M² images gallery: {e}")
+            import traceback
+            traceback.print_exc()
 
     def update_beam_gallery(self):
         """Update beam images gallery showing multiple z positions"""
@@ -1518,7 +1742,24 @@ class BeamPropagationGUI(QMainWindow):
                 
                 x = temp_tool.x
                 y = temp_tool.y
-                extent = [x[0]*1e3, x[-1]*1e3, y[0]*1e3, y[-1]*1e3]
+                
+                # Calculate beam width and crop to 4×FWHM
+                wx, wy = compute_beam_width(intensity, x, y)
+                fwhm_x = 1.177 * wx
+                fwhm_y = 1.177 * wy
+                crop_x = 4 * fwhm_x
+                crop_y = 4 * fwhm_y
+                
+                # Find indices for cropping
+                x_mask = np.abs(x) <= crop_x / 2
+                y_mask = np.abs(y) <= crop_y / 2
+                
+                # Crop arrays
+                x_crop = x[x_mask]
+                y_crop = y[y_mask]
+                intensity_crop = intensity_norm[np.ix_(y_mask, x_mask)]
+                phase_crop = phase[np.ix_(y_mask, x_mask)]
+                extent_crop = [x_crop[0]*1e3, x_crop[-1]*1e3, y_crop[0]*1e3, y_crop[-1]*1e3]
                 
                 if display_type == "Both":
                     # Show both intensity and phase side by side
@@ -1527,24 +1768,21 @@ class BeamPropagationGUI(QMainWindow):
                     ax_phase = self.gallery_canvas.fig.add_subplot(nrows, ncols*2, idx*2 + 2)
                     
                     # Intensity
-                    ax_int.imshow(intensity_norm, extent=extent, origin='lower', 
-                                 cmap='hot', aspect='equal')
+                    ax_int.imshow(intensity_crop, extent=extent_crop, origin='lower', 
+                                 cmap='plasma', aspect='equal', vmin=0.001, vmax=1)
                     ax_int.set_title(f'z={z_pos*1e3:.0f}mm\nIntensity', fontsize=8)
                     ax_int.axis('off')
                     
                     # Phase
-                    ax_phase.imshow(phase, extent=extent, origin='lower',
+                    ax_phase.imshow(phase_crop, extent=extent_crop, origin='lower',
                                    cmap='twilight', aspect='equal', vmin=-np.pi, vmax=np.pi)
                     ax_phase.set_title(f'Phase', fontsize=8)
                     ax_phase.axis('off')
                     
                 elif display_type == "Intensity":
                     ax = self.gallery_canvas.fig.add_subplot(nrows, ncols, idx + 1)
-                    ax.imshow(intensity_norm, extent=extent, origin='lower',
-                             cmap='hot', aspect='equal')
-                    
-                    # Calculate beam widths
-                    wx, wy = compute_beam_width(intensity, x, y)
+                    ax.imshow(intensity_crop, extent=extent_crop, origin='lower',
+                             cmap='plasma', aspect='equal', vmin=0.001, vmax=1)
                     
                     ax.set_title(f'z={z_pos*1e3:.0f}mm\nwx={wx*1e6:.0f}µm, wy={wy*1e6:.0f}µm', 
                                fontsize=8)
@@ -1554,7 +1792,7 @@ class BeamPropagationGUI(QMainWindow):
                     
                 else:  # Phase
                     ax = self.gallery_canvas.fig.add_subplot(nrows, ncols, idx + 1)
-                    im = ax.imshow(phase, extent=extent, origin='lower',
+                    im = ax.imshow(phase_crop, extent=extent_crop, origin='lower',
                                   cmap='twilight', aspect='equal', vmin=-np.pi, vmax=np.pi)
                     ax.set_title(f'z={z_pos*1e3:.0f}mm\nPhase', fontsize=8)
                     ax.set_xlabel('x (mm)', fontsize=7)
