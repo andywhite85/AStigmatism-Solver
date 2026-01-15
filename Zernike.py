@@ -293,7 +293,7 @@ class BeamPropagationTool:
         
         return self.field_initial
     
-    def setup_m2_measurement(self, z_gap, f_m2, n_points=20):
+    def setup_m2_measurement(self, z_gap, f_m2, n_points=20, z_range=None):
         """
         Setup M² measurement after current position
         
@@ -307,6 +307,10 @@ class BeamPropagationTool:
             Focal length of M² measurement lens (meters)
         n_points : int
             Number of measurement points (default 20)
+        z_range : float or None
+            Total measurement range in meters. If None, automatically calculated
+            as 5× the estimated Rayleigh range. This is the total span over which
+            the n_points measurements are distributed (centered on focus).
             
         Returns:
         --------
@@ -317,6 +321,9 @@ class BeamPropagationTool:
             - w0_x, w0_y: Waist sizes
             - zR_x, zR_y: Rayleigh ranges
             - M2_x, M2_y: M² values
+            - z_gap: The input z_gap value
+            - z_range: The measurement range used
+            - n_points: Number of measurement points
         """
         print(f"\n{'='*70}")
         print("M² MEASUREMENT SETUP")
@@ -345,20 +352,33 @@ class BeamPropagationTool:
         w0_estimate = self.wavelength * f_m2 / (np.pi * w_avg)
         zR_estimate = np.pi * w0_estimate**2 / self.wavelength
         
-        # Measurement range: focus ± 2.5*zR
-        z_start = z_focus_estimate - 2.5 * zR_estimate
-        z_end = z_focus_estimate + 2.5 * zR_estimate
+        # Determine measurement range
+        if z_range is not None:
+            # User-specified range
+            z_range_used = z_range
+            z_start = z_focus_estimate - z_range_used / 2
+            z_end = z_focus_estimate + z_range_used / 2
+            print(f"\n  Using specified z_range: {z_range*1e3:.1f} mm")
+        else:
+            # Auto-calculate: span 5× Rayleigh range (±2.5×zR from focus)
+            z_range_used = 5 * zR_estimate
+            z_start = z_focus_estimate - 2.5 * zR_estimate
+            z_end = z_focus_estimate + 2.5 * zR_estimate
+            print(f"\n  Auto z_range: {z_range_used*1e3:.2f} mm (5× estimated zR)")
         
         # Make sure we don't go before the lens
         if z_start < z_m2_lens:
             z_start = z_m2_lens + 0.001  # Just after lens
         
         print(f"\nM² measurement range:")
+        print(f"  z_gap (to M² lens): {z_gap*1e3:.1f} mm")
         print(f"  Estimated focus: z={z_focus_estimate*1e3:.1f}mm")
         print(f"  Estimated waist: w0≈{w0_estimate*1e6:.1f}µm")
         print(f"  Estimated Rayleigh range: zR≈{zR_estimate*1e3:.1f}mm")
         print(f"  Measurement from z={z_start*1e3:.1f}mm to z={z_end*1e3:.1f}mm")
+        print(f"  Measurement range (z_range): {z_range_used*1e3:.1f} mm")
         print(f"  Number of points: {n_points}")
+        print(f"  Point spacing: {(z_end - z_start) / (n_points - 1) * 1e3:.2f} mm")
         
         # Store current field at M² lens
         field_at_m2_lens = self.current_field.copy()
@@ -467,7 +487,10 @@ class BeamPropagationTool:
             'M2_x': M2_x,
             'M2_y': M2_y,
             'z_m2_lens': z_m2_lens,
-            'f_m2': f_m2
+            'f_m2': f_m2,
+            'z_gap': z_gap,
+            'z_range': z_range_used,
+            'n_points': n_points
         }
         
         self.m2_data = m2_data
