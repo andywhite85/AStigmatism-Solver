@@ -11,12 +11,14 @@ Date: January 2026
 
 import sys
 import os
+import json
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QGridLayout, QLabel, QLineEdit, 
                              QPushButton, QTabWidget, QTextEdit, QGroupBox,
                              QCheckBox, QComboBox, QProgressBar, QMessageBox,
-                             QSplitter, QScrollArea, QFrame, QStatusBar)
+                             QSplitter, QScrollArea, QFrame, QStatusBar,
+                             QFileDialog)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QCursor
 
@@ -26,12 +28,14 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D
+import matplotlib.pyplot as plt
 
 # Import the beam propagation tool
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from Zernike import (BeamPropagationTool, 
                                    propagate_angular_spectrum, 
-                                   compute_beam_width)
+                                   compute_beam_width,
+                                   to_cpu)
 
 
 class SimulationWorker(QThread):
@@ -57,7 +61,8 @@ class SimulationWorker(QThread):
                 w0=self.params['w0'],
                 wavelength=self.params['wavelength'],
                 grid_size=self.params['grid_size'],
-                physical_size=self.params['physical_size']
+                physical_size=self.params['physical_size'],
+                use_gpu=self.params.get('use_gpu', False)
             )
             
             # Start with perfect beam
@@ -85,8 +90,9 @@ class SimulationWorker(QThread):
                             dz
                         )
                         
-                        # Calculate beam widths
-                        intensity = np.abs(field_z)**2
+                        # Calculate beam widths (ensure on CPU)
+                        field_cpu = to_cpu(field_z)
+                        intensity = np.abs(field_cpu)**2
                         wx, wy = compute_beam_width(intensity, self.tool.x, self.tool.y)
                         
                         self.full_propagation_z.append(z)
@@ -101,6 +107,7 @@ class SimulationWorker(QThread):
             self.progress.emit("Adding aberrations...")
             self.tool.propagate_to(self.params['z_aberration'])
             
+            # Add GUI-specified Zernike aberrations (backwards compatibility)
             if self.params['z22'] != 0:
                 self.tool.add_zernike_aberration(2, 2, self.params['z22'])
             if self.params['z2m2'] != 0:
@@ -110,8 +117,25 @@ class SimulationWorker(QThread):
             if self.params['z3m1'] != 0:
                 self.tool.add_zernike_aberration(3, -1, self.params['z3m1'])
             
-            if (self.params['z22'] != 0 or self.params['z2m2'] != 0 or 
-                self.params['z31'] != 0 or self.params['z3m1'] != 0):
+            # Add extended Zernike coefficients from JSON (if present)
+            has_extended_aberrations = False
+            if 'zernike_coefficients' in self.params:
+                for key, value in self.params['zernike_coefficients'].items():
+                    if value != 0:
+                        # Parse Z(n,m) format
+                        try:
+                            # Extract n and m from "Z(n,m)" format
+                            inner = key[2:-1]  # Remove "Z(" and ")"
+                            n, m = map(int, inner.split(','))
+                            self.tool.add_zernike_aberration(n, m, value)
+                            has_extended_aberrations = True
+                        except:
+                            print(f"Warning: Could not parse Zernike key: {key}")
+            
+            has_gui_aberrations = (self.params['z22'] != 0 or self.params['z2m2'] != 0 or 
+                                   self.params['z31'] != 0 or self.params['z3m1'] != 0)
+            
+            if has_gui_aberrations or has_extended_aberrations:
                 self.tool.apply_aberrations_at_current_position()
                 self.tool.clear_aberrations()
             
@@ -144,10 +168,19 @@ class SimulationWorker(QThread):
             
             # M² measurement
             self.progress.emit("Performing M² measurement...")
+            
+            # Parse z_range (empty string means auto)
+            z_range_text = self.params.get('z_range', '').strip()
+            if z_range_text == '' or z_range_text.lower() == 'auto':
+                z_range = None  # Auto-calculate based on Rayleigh range
+            else:
+                z_range = float(z_range_text) * 1e-3  # Convert mm to m
+            
             self.m2_data = self.tool.setup_m2_measurement(
                 z_gap=self.params['z_gap'],
                 f_m2=self.params['f_m2'],
-                n_points=self.params['n_points']
+                n_points=self.params['n_points'],
+                z_range=z_range
             )
             
             # Add M² measurement data to full propagation
@@ -172,63 +205,39 @@ class SimulationWorker(QThread):
             }
             
             # Pre-calculate beam profiles for hover feature
+            # Use the field_at_m2_lens which is already stored by setup_m2_measurement
             self.progress.emit("Pre-calculating beam profiles for hover...")
             self.hover_fields = {}
             
-            # Sample at ~30 positions for smooth hover
-            n_hover_samples = min(30, len(z_array))
-            hover_z_positions = np.linspace(z_array[0], z_array[-1], n_hover_samples)
-            
-            for z_pos in hover_z_positions:
-                # We need to reconstruct the field at each z position
-                # Start fresh each time to ensure consistency
-                temp_tool = BeamPropagationTool(
-                    w0=self.params['w0'],
-                    wavelength=self.params['wavelength'],
-                    grid_size=self.params['grid_size'],
-                    physical_size=self.params['physical_size']
+            # Get the stored field at M² lens position
+            if hasattr(self.tool, 'field_at_m2_lens'):
+                field_at_m2_lens = to_cpu(self.tool.field_at_m2_lens)
+                z_m2_lens = self.m2_data['z_m2_lens']
+                
+                # Sample hover positions across the M² measurement range
+                n_hover_samples = min(30, len(self.m2_data['z_array']))
+                hover_z_positions = np.linspace(
+                    self.m2_data['z_array'][0], 
+                    self.m2_data['z_array'][-1], 
+                    n_hover_samples
                 )
-                temp_tool.start_fresh(with_current_aberrations=False)
                 
-                # Apply aberrations if we're past that point
-                if z_pos >= self.params['z_aberration']:
-                    temp_tool.propagate_to(self.params['z_aberration'])
-                    
-                    if self.params['z22'] != 0:
-                        temp_tool.add_zernike_aberration(2, 2, self.params['z22'])
-                    if self.params['z2m2'] != 0:
-                        temp_tool.add_zernike_aberration(2, -2, self.params['z2m2'])
-                    if self.params['z31'] != 0:
-                        temp_tool.add_zernike_aberration(3, 1, self.params['z31'])
-                    if self.params['z3m1'] != 0:
-                        temp_tool.add_zernike_aberration(3, -1, self.params['z3m1'])
-                    
-                    if (self.params['z22'] != 0 or self.params['z2m2'] != 0 or 
-                        self.params['z31'] != 0 or self.params['z3m1'] != 0):
-                        temp_tool.apply_aberrations_at_current_position()
-                        temp_tool.clear_aberrations()
-                
-                # Apply correction if enabled and we're past corrector
-                if self.params['enable_correction'] and z_pos >= self.params['z_corrector']:
-                    temp_tool.propagate_to(self.params['z_corrector'])
-                    temp_tool.apply_cylindrical_pair_for_astigmatism_correction(
-                        f1=self.params['f1'],
-                        f2=self.params['f2'],
-                        spacing=self.params['spacing'],
-                        angle1_deg=self.params['angle1'],
-                        angle2_deg=self.params['angle2']
+                # Propagate from the M² lens position to each hover position
+                for i, z_pos in enumerate(hover_z_positions):
+                    dz = z_pos - z_m2_lens
+                    field_z = propagate_angular_spectrum(
+                        field_at_m2_lens,
+                        self.tool.wavelength,
+                        self.tool.dx,
+                        dz,
+                        use_gpu=False  # Keep on CPU for storage
                     )
-                
-                # Propagate to target z position
-                temp_tool.propagate_to(z_pos)
-                
-                # Debug: Check field statistics
-                field_max = np.max(np.abs(temp_tool.current_field)**2)
-                field_mean = np.mean(np.abs(temp_tool.current_field)**2)
-                print(f"  Hover field at z={z_pos*1e3:.1f}mm: max={field_max:.2e}, mean={field_mean:.2e}, tool.current_z={temp_tool.current_z*1e3:.1f}mm")
-                
-                # Store field for this z position
-                self.hover_fields[z_pos] = temp_tool.current_field.copy()
+                    
+                    # Store CPU version
+                    self.hover_fields[z_pos] = to_cpu(field_z)
+                    
+                    if (i + 1) % 10 == 0:
+                        self.progress.emit(f"Pre-calculating hover images... {i+1}/{n_hover_samples}")
             
             self.progress.emit("Simulation complete!")
             self.finished.emit()
@@ -445,7 +454,7 @@ class BeamPropagationGUI(QMainWindow):
         m2_group = self.create_m2_params_section()
         layout.addWidget(m2_group)
         
-        # Action buttons
+        # Action buttons - Row 1
         button_layout = QHBoxLayout()
         
         self.run_button = QPushButton("▶ RUN SIMULATION")
@@ -460,6 +469,42 @@ class BeamPropagationGUI(QMainWindow):
         button_layout.addWidget(defaults_button)
         
         layout.addLayout(button_layout)
+        
+        # Action buttons - Row 2 (JSON Load/Save)
+        json_button_layout = QHBoxLayout()
+        
+        load_json_button = QPushButton("📂 Load Config")
+        load_json_button.setMinimumHeight(35)
+        load_json_button.setToolTip("Load configuration from JSON file")
+        load_json_button.clicked.connect(self.load_config_from_json)
+        json_button_layout.addWidget(load_json_button)
+        
+        save_json_button = QPushButton("💾 Save Config")
+        save_json_button.setMinimumHeight(35)
+        save_json_button.setToolTip("Save current configuration to JSON file")
+        save_json_button.clicked.connect(self.save_config_to_json)
+        json_button_layout.addWidget(save_json_button)
+        
+        layout.addLayout(json_button_layout)
+        
+        # Action buttons - Row 3 (Solution Save/Load)
+        solution_button_layout = QHBoxLayout()
+        
+        load_solution_button = QPushButton("📥 Load Solution")
+        load_solution_button.setMinimumHeight(35)
+        load_solution_button.setToolTip("Load a previously saved simulation solution")
+        load_solution_button.setStyleSheet("background-color: #4a7c4e;")
+        load_solution_button.clicked.connect(self.load_solution)
+        solution_button_layout.addWidget(load_solution_button)
+        
+        save_solution_button = QPushButton("📤 Save Solution")
+        save_solution_button.setMinimumHeight(35)
+        save_solution_button.setToolTip("Save current simulation results for later use")
+        save_solution_button.setStyleSheet("background-color: #4a7c4e;")
+        save_solution_button.clicked.connect(self.save_solution)
+        solution_button_layout.addWidget(save_solution_button)
+        
+        layout.addLayout(solution_button_layout)
         
         # Add stretch at bottom
         layout.addStretch()
@@ -490,7 +535,7 @@ class BeamPropagationGUI(QMainWindow):
         # Grid size
         layout.addWidget(QLabel("Grid size:"), row, 0)
         self.grid_size_input = QComboBox()
-        self.grid_size_input.addItems(["256", "512", "1024"])
+        self.grid_size_input.addItems(["128", "256", "512", "1024", "2048", "4096"])
         self.grid_size_input.setCurrentText("512")
         layout.addWidget(self.grid_size_input, row, 1)
         row += 1
@@ -499,6 +544,13 @@ class BeamPropagationGUI(QMainWindow):
         layout.addWidget(QLabel("Window size (mm):"), row, 0)
         self.physical_size_input = QLineEdit("8")
         layout.addWidget(self.physical_size_input, row, 1)
+        row += 1
+        
+        # GPU acceleration checkbox
+        self.use_gpu_check = QCheckBox("Use GPU acceleration (CuPy)")
+        self.use_gpu_check.setChecked(False)  # Default to CPU
+        self.use_gpu_check.setToolTip("Enable GPU acceleration if CuPy is installed and CUDA GPU is available")
+        layout.addWidget(self.use_gpu_check, row, 0, 1, 2)
         row += 1
         
         group.setLayout(layout)
@@ -620,6 +672,14 @@ class BeamPropagationGUI(QMainWindow):
         layout.addWidget(self.n_points_input, row, 1)
         row += 1
         
+        # Measurement range (z_range) - total span over which data points are taken
+        layout.addWidget(QLabel("Meas. range z_range (mm):"), row, 0)
+        self.z_range_input = QLineEdit("")
+        self.z_range_input.setPlaceholderText("Auto (5×zR)")
+        self.z_range_input.setToolTip("Total measurement range in mm. Leave empty for auto (5× Rayleigh range)")
+        layout.addWidget(self.z_range_input, row, 1)
+        row += 1
+        
         group.setLayout(layout)
         return group
         
@@ -646,6 +706,11 @@ class BeamPropagationGUI(QMainWindow):
         self.m2_toolbar = NavigationToolbar(self.m2_canvas, self)
         m2_layout.addWidget(self.m2_toolbar)
         m2_layout.addWidget(self.m2_canvas)
+        
+        # Setup hover for M² plot
+        self.m2_hover_label = None
+        self.m2_canvas.mpl_connect('motion_notify_event', self.on_m2_hover)
+        self.m2_canvas.mpl_connect('axes_leave_event', self.on_m2_leave)
         
         self.tabs.addTab(self.m2_tab, "M² Measurement")
         
@@ -788,6 +853,30 @@ class BeamPropagationGUI(QMainWindow):
         
         self.tabs.addTab(self.summary_tab, "Summary")
         
+        # Tab 7: Zernike Reference
+        self.zernike_tab = QWidget()
+        zernike_layout = QVBoxLayout(self.zernike_tab)
+        
+        # Info label
+        zernike_info = QLabel("Reference: Common Zernike Polynomials (OSA/ANSI Standard) - Hover over plots for 3D view")
+        zernike_info.setFont(QFont("Arial", 11, QFont.Bold))
+        zernike_info.setAlignment(Qt.AlignCenter)
+        zernike_layout.addWidget(zernike_info)
+        
+        # Canvas for Zernike plots
+        self.zernike_canvas = MplCanvas(self, width=14, height=10, dpi=100)
+        zernike_layout.addWidget(self.zernike_canvas)
+        
+        self.tabs.addTab(self.zernike_tab, "Zernike Reference")
+        
+        # Generate Zernike reference plots and 3D hover images
+        self.generate_zernike_reference()
+        
+        # Setup hover for Zernike tab
+        self.zernike_hover_label = None
+        self.zernike_canvas.mpl_connect('motion_notify_event', self.on_zernike_hover)
+        self.zernike_canvas.mpl_connect('axes_leave_event', self.on_zernike_leave)
+        
         layout.addWidget(self.tabs)
         
         return widget
@@ -821,8 +910,479 @@ class BeamPropagationGUI(QMainWindow):
         self.z_gap_input.setText("50")
         self.f_m2_input.setText("150")
         self.n_points_input.setText("20")
+        self.z_range_input.setText("")  # Auto by default
+        
+        # Clear extended Zernike coefficients
+        self.extended_zernike_coefficients = {}
         
         self.statusBar.showMessage("Loaded default values")
+    
+    def get_default_config(self):
+        """Get default configuration as a dictionary"""
+        config = {
+            "config_version": "1.0",
+            "description": "Beam Propagation Tool Configuration",
+            
+            "beam_parameters": {
+                "wavelength_nm": 1064,
+                "w0_um": 300,
+                "grid_size": 512,
+                "window_size_mm": 8,
+                "use_gpu": False
+            },
+            
+            "aberration_setup": {
+                "z_aberration_mm": 30
+            },
+            
+            "zernike_coefficients": {}
+        }
+        
+        # Generate all valid Zernike modes up to n=15
+        for n in range(16):
+            for m in range(-n, n+1):
+                if (n - abs(m)) % 2 == 0:
+                    config["zernike_coefficients"][f"Z({n},{m})"] = 0
+        
+        config["cylindrical_correction"] = {
+            "enabled": True,
+            "z_corrector_mm": 80,
+            "f1_mm": 200,
+            "f2_mm": 250,
+            "spacing_mm": 50,
+            "angle1_deg": 0,
+            "angle2_deg": 90
+        }
+        
+        config["m2_measurement"] = {
+            "z_gap_mm": 50,
+            "f_m2_mm": 150,
+            "n_points": 20,
+            "z_range_mm": None
+        }
+        
+        return config
+    
+    def save_config_to_json(self):
+        """Save current configuration to a JSON file"""
+        
+        # Build configuration from current GUI values
+        config = {
+            "config_version": "1.0",
+            "description": "Beam Propagation Tool Configuration",
+            
+            "beam_parameters": {
+                "wavelength_nm": float(self.wavelength_input.text()),
+                "w0_um": float(self.w0_input.text()),
+                "grid_size": int(self.grid_size_input.currentText()),
+                "window_size_mm": float(self.physical_size_input.text()),
+                "use_gpu": self.use_gpu_check.isChecked()
+            },
+            
+            "aberration_setup": {
+                "z_aberration_mm": float(self.z_aberration_input.text())
+            },
+            
+            "zernike_coefficients": {}
+        }
+        
+        # Generate all valid Zernike modes up to n=15 with zero values
+        for n in range(16):
+            for m in range(-n, n+1):
+                if (n - abs(m)) % 2 == 0:
+                    config["zernike_coefficients"][f"Z({n},{m})"] = 0
+        
+        # Set GUI-specified values
+        config["zernike_coefficients"]["Z(2,2)"] = float(self.z22_input.text())
+        config["zernike_coefficients"]["Z(2,-2)"] = float(self.z2m2_input.text())
+        config["zernike_coefficients"]["Z(3,1)"] = float(self.z31_input.text())
+        config["zernike_coefficients"]["Z(3,-1)"] = float(self.z3m1_input.text())
+        
+        # Add extended coefficients if they exist
+        if hasattr(self, 'extended_zernike_coefficients'):
+            for key, value in self.extended_zernike_coefficients.items():
+                if key in config["zernike_coefficients"]:
+                    config["zernike_coefficients"][key] = value
+        
+        config["cylindrical_correction"] = {
+            "enabled": self.enable_correction_check.isChecked(),
+            "z_corrector_mm": float(self.z_corrector_input.text()),
+            "f1_mm": float(self.f1_input.text()),
+            "f2_mm": float(self.f2_input.text()),
+            "spacing_mm": float(self.spacing_input.text()),
+            "angle1_deg": float(self.angle1_input.text()),
+            "angle2_deg": float(self.angle2_input.text())
+        }
+        
+        z_range_text = self.z_range_input.text().strip()
+        config["m2_measurement"] = {
+            "z_gap_mm": float(self.z_gap_input.text()),
+            "f_m2_mm": float(self.f_m2_input.text()),
+            "n_points": int(self.n_points_input.text()),
+            "z_range_mm": float(z_range_text) if z_range_text else None
+        }
+        
+        # Open file dialog
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save Configuration", "beam_config.json", 
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, indent=4)
+                self.statusBar.showMessage(f"Configuration saved to: {filename}")
+                QMessageBox.information(self, "Success", f"Configuration saved to:\n{filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save configuration:\n{str(e)}")
+    
+    def load_config_from_json(self):
+        """Load configuration from a JSON file"""
+        
+        # Open file dialog
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Load Configuration", "", 
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if not filename:
+            return
+        
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            # Apply beam parameters
+            if "beam_parameters" in config:
+                bp = config["beam_parameters"]
+                if "wavelength_nm" in bp:
+                    self.wavelength_input.setText(str(bp["wavelength_nm"]))
+                if "w0_um" in bp:
+                    self.w0_input.setText(str(bp["w0_um"]))
+                if "grid_size" in bp:
+                    self.grid_size_input.setCurrentText(str(bp["grid_size"]))
+                if "window_size_mm" in bp:
+                    self.physical_size_input.setText(str(bp["window_size_mm"]))
+                if "use_gpu" in bp:
+                    self.use_gpu_check.setChecked(bp["use_gpu"])
+            
+            # Apply aberration setup
+            if "aberration_setup" in config:
+                ab = config["aberration_setup"]
+                if "z_aberration_mm" in ab:
+                    self.z_aberration_input.setText(str(ab["z_aberration_mm"]))
+            
+            # Apply Zernike coefficients
+            if "zernike_coefficients" in config:
+                zc = config["zernike_coefficients"]
+                
+                # GUI-displayed coefficients
+                if "Z(2,2)" in zc:
+                    self.z22_input.setText(str(zc["Z(2,2)"]))
+                if "Z(2,-2)" in zc:
+                    self.z2m2_input.setText(str(zc["Z(2,-2)"]))
+                if "Z(3,1)" in zc:
+                    self.z31_input.setText(str(zc["Z(3,1)"]))
+                if "Z(3,-1)" in zc:
+                    self.z3m1_input.setText(str(zc["Z(3,-1)"]))
+                
+                # Store all coefficients for extended use
+                self.extended_zernike_coefficients = zc.copy()
+                
+                # Count non-zero extended coefficients (not in GUI)
+                gui_keys = {"Z(2,2)", "Z(2,-2)", "Z(3,1)", "Z(3,-1)"}
+                extended_count = sum(1 for k, v in zc.items() if k not in gui_keys and v != 0)
+                if extended_count > 0:
+                    self.statusBar.showMessage(f"Loaded {extended_count} extended Zernike coefficients from JSON")
+            
+            # Apply cylindrical correction
+            if "cylindrical_correction" in config:
+                cc = config["cylindrical_correction"]
+                if "enabled" in cc:
+                    self.enable_correction_check.setChecked(cc["enabled"])
+                if "z_corrector_mm" in cc:
+                    self.z_corrector_input.setText(str(cc["z_corrector_mm"]))
+                if "f1_mm" in cc:
+                    self.f1_input.setText(str(cc["f1_mm"]))
+                if "f2_mm" in cc:
+                    self.f2_input.setText(str(cc["f2_mm"]))
+                if "spacing_mm" in cc:
+                    self.spacing_input.setText(str(cc["spacing_mm"]))
+                if "angle1_deg" in cc:
+                    self.angle1_input.setText(str(cc["angle1_deg"]))
+                if "angle2_deg" in cc:
+                    self.angle2_input.setText(str(cc["angle2_deg"]))
+            
+            # Apply M² measurement
+            if "m2_measurement" in config:
+                m2 = config["m2_measurement"]
+                if "z_gap_mm" in m2:
+                    self.z_gap_input.setText(str(m2["z_gap_mm"]))
+                if "f_m2_mm" in m2:
+                    self.f_m2_input.setText(str(m2["f_m2_mm"]))
+                if "n_points" in m2:
+                    self.n_points_input.setText(str(m2["n_points"]))
+                if "z_range_mm" in m2:
+                    if m2["z_range_mm"] is not None:
+                        self.z_range_input.setText(str(m2["z_range_mm"]))
+                    else:
+                        self.z_range_input.setText("")
+            
+            self.statusBar.showMessage(f"Configuration loaded from: {filename}")
+            QMessageBox.information(self, "Success", f"Configuration loaded from:\n{filename}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load configuration:\n{str(e)}")
+    
+    def save_solution(self):
+        """Save simulation solution with pre-rendered images only (fast save/load)"""
+        
+        import pickle
+        
+        # Check if we have simulation results
+        if not hasattr(self, 'm2_data') or self.m2_data is None:
+            QMessageBox.warning(self, "No Data", "No simulation results to save. Run a simulation first.")
+            return
+        
+        # Open file dialog
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save Solution", "beam_solution.pkl", 
+            "Pickle Files (*.pkl);;All Files (*)"
+        )
+        
+        if not filename:
+            return
+        
+        try:
+            self.statusBar.showMessage("Saving solution...")
+            QApplication.processEvents()
+            
+            # Build lightweight solution dictionary (images only, no field arrays)
+            # Copy m2_data but exclude the large field_at_m2_lens array
+            m2_data_lite = {k: v for k, v in self.m2_data.items() if k != 'field_at_m2_lens'}
+            
+            solution = {
+                'version': '2.0',  # New version - images only
+                'description': 'Beam Propagation Solution File (Images Only)',
+                
+                # Parameters used
+                'params': self.worker.params if hasattr(self, 'worker') and self.worker else None,
+                
+                # M² measurement data (without field arrays)
+                'm2_data': m2_data_lite,
+                
+                # Propagation data (just the curves, small)
+                'propagation_data': self.propagation_data if hasattr(self, 'propagation_data') else None,
+                
+                # Tool parameters (minimal, for display purposes)
+                'tool_params': {
+                    'wavelength': self.tool.wavelength,
+                    'w0': self.tool.w0,
+                    'N': self.tool.N,
+                    'L': self.tool.L,
+                } if hasattr(self, 'tool') and self.tool else None,
+                
+                # Pre-rendered hover images as PNG bytes (this is what we need for viewing)
+                'hover_images_bytes': {},
+                
+                # Pre-rendered M² hover images
+                'm2_hover_images_bytes': {},
+            }
+            
+            # Convert propagation hover QPixmaps to PNG bytes
+            from PyQt5.QtCore import QBuffer, QIODevice
+            
+            if hasattr(self, 'hover_images') and self.hover_images:
+                self.statusBar.showMessage("Saving propagation images...")
+                QApplication.processEvents()
+                for z_pos, pixmap in self.hover_images.items():
+                    buffer = QBuffer()
+                    buffer.open(QIODevice.WriteOnly)
+                    pixmap.save(buffer, 'PNG')
+                    solution['hover_images_bytes'][z_pos] = bytes(buffer.data())
+                    buffer.close()
+            
+            # Convert M² hover cache QPixmaps to PNG bytes
+            if hasattr(self, '_m2_hover_cache') and self._m2_hover_cache:
+                self.statusBar.showMessage("Saving M² images...")
+                QApplication.processEvents()
+                for idx, pixmap in self._m2_hover_cache.items():
+                    buffer = QBuffer()
+                    buffer.open(QIODevice.WriteOnly)
+                    pixmap.save(buffer, 'PNG')
+                    solution['m2_hover_images_bytes'][idx] = bytes(buffer.data())
+                    buffer.close()
+            
+            # Save with pickle
+            self.statusBar.showMessage("Writing file...")
+            QApplication.processEvents()
+            with open(filename, 'wb') as f:
+                pickle.dump(solution, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            # Get file size
+            import os
+            file_size = os.path.getsize(filename) / (1024 * 1024)  # MB
+            
+            self.statusBar.showMessage(f"Solution saved to: {filename} ({file_size:.1f} MB)")
+            QMessageBox.information(self, "Success", 
+                f"Solution saved to:\n{filename}\n\nFile size: {file_size:.1f} MB")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save solution:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    def load_solution(self):
+        """Load a previously saved simulation solution"""
+        
+        import pickle
+        import io
+        from PyQt5.QtGui import QPixmap
+        
+        # Open file dialog
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Load Solution", "", 
+            "Pickle Files (*.pkl);;All Files (*)"
+        )
+        
+        if not filename:
+            return
+        
+        try:
+            self.statusBar.showMessage("Loading solution...")
+            QApplication.processEvents()
+            
+            # Load pickle file
+            with open(filename, 'rb') as f:
+                solution = pickle.load(f)
+            
+            # Verify it's a valid solution file
+            if 'version' not in solution or 'm2_data' not in solution:
+                QMessageBox.critical(self, "Error", "Invalid solution file format.")
+                return
+            
+            # Restore M² data
+            self.m2_data = solution['m2_data']
+            
+            # Restore propagation data
+            if solution.get('propagation_data'):
+                self.propagation_data = solution['propagation_data']
+            
+            # Restore tool parameters (create a minimal tool-like object)
+            if solution.get('tool_params'):
+                tp = solution['tool_params']
+                
+                # Create a simple namespace object to hold tool parameters
+                class ToolParams:
+                    pass
+                
+                self.tool = ToolParams()
+                self.tool.wavelength = tp['wavelength']
+                self.tool.w0 = tp['w0']
+                self.tool.N = tp['N']
+                self.tool.L = tp['L']
+            
+            # Restore parameters and update GUI
+            if solution.get('params'):
+                params = solution['params']
+                
+                # Update GUI fields
+                self.wavelength_input.setText(str(params['wavelength'] * 1e9))
+                self.w0_input.setText(str(params['w0'] * 1e6))
+                self.grid_size_input.setCurrentText(str(params['grid_size']))
+                self.physical_size_input.setText(str(params['physical_size'] * 1e3))
+                
+                self.z_aberration_input.setText(str(params['z_aberration'] * 1e3))
+                self.z22_input.setText(str(params['z22']))
+                self.z2m2_input.setText(str(params['z2m2']))
+                self.z31_input.setText(str(params['z31']))
+                self.z3m1_input.setText(str(params['z3m1']))
+                
+                self.enable_correction_check.setChecked(params['enable_correction'])
+                self.z_corrector_input.setText(str(params['z_corrector'] * 1e3))
+                self.f1_input.setText(str(params['f1'] * 1e3))
+                self.f2_input.setText(str(params['f2'] * 1e3))
+                self.spacing_input.setText(str(params['spacing'] * 1e3))
+                self.angle1_input.setText(str(params['angle1']))
+                self.angle2_input.setText(str(params['angle2']))
+                
+                self.z_gap_input.setText(str(params['z_gap'] * 1e3))
+                self.f_m2_input.setText(str(params['f_m2'] * 1e3))
+                self.n_points_input.setText(str(params['n_points']))
+                
+                z_range = params.get('z_range', '')
+                if z_range and z_range != 'auto':
+                    self.z_range_input.setText(str(z_range))
+                else:
+                    self.z_range_input.setText('')
+                
+                self.use_gpu_check.setChecked(params.get('use_gpu', False))
+            
+            # Restore hover images from PNG bytes
+            self.statusBar.showMessage("Loading images...")
+            QApplication.processEvents()
+            
+            self.hover_images = {}
+            if solution.get('hover_images_bytes'):
+                for z_pos, png_bytes in solution['hover_images_bytes'].items():
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(png_bytes, 'PNG')
+                    self.hover_images[z_pos] = pixmap
+            
+            # Restore M² hover images from PNG bytes
+            self._m2_hover_cache = {}
+            if solution.get('m2_hover_images_bytes'):
+                for idx, png_bytes in solution['m2_hover_images_bytes'].items():
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(png_bytes, 'PNG')
+                    self._m2_hover_cache[idx] = pixmap
+            
+            # Create a dummy worker object to hold params for other methods
+            class DummyWorker:
+                pass
+            self.worker = DummyWorker()
+            self.worker.params = solution.get('params', {})
+            self.worker.tool = self.tool if hasattr(self, 'tool') else None
+            self.worker.m2_data = self.m2_data
+            self.worker.propagation_data = self.propagation_data if hasattr(self, 'propagation_data') else None
+            self.worker.hover_fields = {}  # Not stored in new format
+            
+            # Clear field references (not available in image-only format)
+            self.hover_fields = {}
+            if hasattr(self, '_field_at_m2_lens'):
+                delattr(self, '_field_at_m2_lens')
+            
+            # Update all displays
+            self.statusBar.showMessage("Updating displays...")
+            QApplication.processEvents()
+            
+            # Update summary
+            if solution.get('params'):
+                self.update_summary(solution['params'])
+            
+            # Plot results
+            self.plot_m2_results()
+            if hasattr(self, 'propagation_data') and self.propagation_data:
+                self.plot_propagation(solution.get('params', {}))
+            
+            # Initialize 3D profile position (but can't render without fields)
+            self.z_position_input.setText(f"{self.m2_data['z_m2_lens']*1e3:.1f}")
+            
+            # Note: Beam gallery and M² images gallery won't work without fields
+            # But hover images are pre-loaded so hover functionality works
+            
+            self.statusBar.showMessage(f"Solution loaded from: {filename}")
+            QMessageBox.information(self, "Success", 
+                f"Solution loaded from:\n{filename}\n\n"
+                f"M²x = {self.m2_data['M2_x']:.3f}\n"
+                f"M²y = {self.m2_data['M2_y']:.3f}\n\n"
+                f"Note: Hover images loaded. Galleries require re-running simulation.")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load solution:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
         
     def get_parameters(self):
         """Extract and validate all parameters"""
@@ -854,8 +1414,17 @@ class BeamPropagationGUI(QMainWindow):
                 # M² parameters
                 'z_gap': float(self.z_gap_input.text()) * 1e-3,
                 'f_m2': float(self.f_m2_input.text()) * 1e-3,
-                'n_points': int(self.n_points_input.text())
+                'n_points': int(self.n_points_input.text()),
+                'z_range': self.z_range_input.text().strip(),  # Keep as string, parse later
+                
+                # GPU setting
+                'use_gpu': self.use_gpu_check.isChecked()
             }
+            
+            # Add extended Zernike coefficients if loaded from JSON
+            if hasattr(self, 'extended_zernike_coefficients') and self.extended_zernike_coefficients:
+                params['zernike_coefficients'] = self.extended_zernike_coefficients
+            
             return params
             
         except ValueError as e:
@@ -909,6 +1478,13 @@ class BeamPropagationGUI(QMainWindow):
         self.hover_fields = self.worker.hover_fields
         params = self.worker.params
         
+        # Store field at M² lens for M² hover functionality
+        if hasattr(self.tool, 'field_at_m2_lens'):
+            self._field_at_m2_lens = self.tool.field_at_m2_lens
+        
+        # Clear M² hover cache (new simulation)
+        self._m2_hover_cache = {}
+        
         # Pre-render hover images
         self.statusBar.showMessage("Pre-rendering hover images...")
         self.hover_images = {}
@@ -948,21 +1524,24 @@ class BeamPropagationGUI(QMainWindow):
         import io
         from PyQt5.QtGui import QPixmap
         
+        # Ensure field is on CPU
+        field_cpu = to_cpu(field)
+        
         # Calculate intensity and phase
-        intensity = np.abs(field)**2
+        intensity = np.abs(field_cpu)**2
         intensity_norm = intensity / np.max(intensity)
-        phase = np.angle(field)
+        phase = np.angle(field_cpu)
         
         # Calculate beam width for cropping (FWHM ≈ 1.177 * w for Gaussian)
         # Use 1/e² width and convert to FWHM
         from Zernike import compute_beam_width
         wx, wy = compute_beam_width(intensity, x, y)
         
-        # Crop to 4× FWHM
+        # Crop to 8× FWHM (increased from 4× to handle 45° astigmatic beams)
         fwhm_x = 1.177 * wx  # Convert 1/e² to FWHM
         fwhm_y = 1.177 * wy
-        crop_x = 4 * fwhm_x
-        crop_y = 4 * fwhm_y
+        crop_x = 12 * fwhm_x
+        crop_y = 12 * fwhm_y
         
         # Find indices for cropping
         x_mask = np.abs(x) <= crop_x / 2
@@ -982,7 +1561,7 @@ class BeamPropagationGUI(QMainWindow):
         X_crop, Y_crop = np.meshgrid(x_crop, y_crop)
         
         im1 = ax1.imshow(intensity_crop, extent=[x_crop[0]*1e3, x_crop[-1]*1e3, y_crop[0]*1e3, y_crop[-1]*1e3],
-                        origin='lower', cmap='plasma', aspect='equal', vmin=0.001, vmax=1)
+                        origin='lower', cmap='nipy_spectral', aspect='equal', vmin=0.001, vmax=1)
         ax1.contour(X_crop*1e3, Y_crop*1e3, intensity_crop, levels=[0.135], 
                    colors='cyan', linewidths=2, linestyles='--')
         ax1.set_xlabel('X (mm)', fontsize=7)
@@ -1077,6 +1656,13 @@ class BeamPropagationGUI(QMainWindow):
         summary += "M² MEASUREMENT RESULTS\n"
         summary += "=" * 70 + "\n\n"
         
+        # M² setup info
+        summary += "--- M² MEASUREMENT SETUP ---\n"
+        summary += f"  z_gap (to M² lens): {self.m2_data['z_gap']*1e3:.1f} mm\n" if 'z_gap' in self.m2_data else ""
+        summary += f"  f_m² (lens focal length): {self.m2_data['f_m2']*1e3:.1f} mm\n"
+        summary += f"  z_range (meas. span): {self.m2_data['z_range']*1e3:.1f} mm\n" if 'z_range' in self.m2_data else ""
+        summary += f"  n_points: {self.m2_data['n_points']}\n\n" if 'n_points' in self.m2_data else "\n"
+        
         summary += "X Direction:\n"
         summary += f"  M²x = {self.m2_data['M2_x']:.4f}\n"
         summary += f"  w0x = {self.m2_data['w0_x']*1e6:.2f} µm\n"
@@ -1162,7 +1748,46 @@ class BeamPropagationGUI(QMainWindow):
         ax.legend(fontsize=9, loc='upper left')
         ax.grid(True, alpha=0.3)
         
+        # Add astigmatism and asymmetry analysis text box
+        astig_total = self.m2_data.get('astigmatism_total', abs(self.m2_data['z_focus_x'] - self.m2_data['z_focus_y']))
+        astig_0 = self.m2_data.get('astig_0_deg', astig_total)
+        astig_45 = self.m2_data.get('astig_45_deg', 0)
+        astig_waves = self.m2_data.get('astig_waves', 0)
+        asymmetry = self.m2_data.get('asymmetry_ratio', max(self.m2_data['w0_x'], self.m2_data['w0_y']) / min(self.m2_data['w0_x'], self.m2_data['w0_y']))
+        ellip_x = self.m2_data.get('ellipticity_at_x_focus', 1.0)
+        ellip_y = self.m2_data.get('ellipticity_at_y_focus', 1.0)
+        
+        # Build analysis text
+        analysis_text = (
+            f"ASTIGMATISM ANALYSIS\n"
+            f"{'─'*24}\n"
+            f"Total: {astig_total*1e3:.3f} mm\n"
+            f"0° (X-Y): {astig_0*1e3:.3f} mm\n"
+            f"45°: {astig_45*1e3:.3f} mm\n"
+            f"~{astig_waves:.2f} waves\n"
+            f"\n"
+            f"ASYMMETRY ANALYSIS\n"
+            f"{'─'*24}\n"
+            f"Waist ratio: {asymmetry:.3f}\n"
+            f"Ellip @ X foc: {ellip_x:.3f}\n"
+            f"Ellip @ Y foc: {ellip_y:.3f}\n"
+            f"\n"
+            f"BEAM PARAMETERS\n"
+            f"{'─'*24}\n"
+            f"w0x: {self.m2_data['w0_x']*1e6:.1f} µm\n"
+            f"w0y: {self.m2_data['w0_y']*1e6:.1f} µm\n"
+            f"zRx: {self.m2_data['zR_x']*1e3:.2f} mm\n"
+            f"zRy: {self.m2_data['zR_y']*1e3:.2f} mm"
+        )
+        
+        # Add text box on the right side
+        props = dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.8)
+        ax.text(1.02, 0.98, analysis_text, transform=ax.transAxes, fontsize=9,
+                verticalalignment='top', fontfamily='monospace', bbox=props)
+        
+        # Adjust layout to make room for text box
         self.m2_canvas.fig.tight_layout()
+        self.m2_canvas.fig.subplots_adjust(right=0.75)
         self.m2_canvas.draw()
         
     def plot_propagation(self, params):
@@ -1316,14 +1941,15 @@ class BeamPropagationGUI(QMainWindow):
             # Update popup with pre-rendered image - INSTANT!
             self.beam_popup.update_with_pixmap(pixmap, z_actual, wx, wy)
             
-            # Position popup near mouse cursor
-            cursor_pos = QCursor.pos()
+            # Use smart positioning
+            popup_width = self.beam_popup.width()
+            popup_height = self.beam_popup.height()
+            x, y = self.get_smart_popup_position(popup_width, popup_height)
             
-            # Offset to the right and down
-            popup_x = cursor_pos.x() + 30
-            popup_y = cursor_pos.y() + 30
-            
-            self.beam_popup.move(popup_x, popup_y)
+            # Convert to global coordinates for the popup window
+            global_pos = self.mapToGlobal(self.pos())
+            self.beam_popup.move(x + global_pos.x() - self.pos().x(), 
+                                y + global_pos.y() - self.pos().y())
             self.beam_popup.show()
             
             # Also update 3D tab z position if that tab is active
@@ -1355,7 +1981,7 @@ class BeamPropagationGUI(QMainWindow):
             params = self.worker.params
             
             # Create fresh temp tool for this position
-            temp_tool = BeamPropagationTool(
+            temp_tool = BeamPropagationTool(verbose=False, 
                 w0=params['w0'],
                 wavelength=params['wavelength'],
                 grid_size=params['grid_size'],
@@ -1394,7 +2020,7 @@ class BeamPropagationGUI(QMainWindow):
             
             # Propagate to target z position
             temp_tool.propagate_to(z_pos)
-            field_at_z = temp_tool.current_field
+            field_at_z = to_cpu(temp_tool.current_field)
             
             # Calculate intensity
             intensity = np.abs(field_at_z)**2
@@ -1422,7 +2048,7 @@ class BeamPropagationGUI(QMainWindow):
                 
                 surf = ax.plot_surface(X[::skip, ::skip]*1e3, Y[::skip, ::skip]*1e3, 
                                       intensity[::skip, ::skip],
-                                      cmap='plasma', antialiased=True, alpha=0.9,
+                                      cmap='nipy_spectral', antialiased=True, alpha=0.9,
                                       vmin=0.001, vmax=1)
                 
                 ax.set_xlabel('X (mm)', fontsize=10, weight='bold')
@@ -1450,7 +2076,7 @@ class BeamPropagationGUI(QMainWindow):
                     np.linspace(0.1, 1, 11)       # Normal spacing for high intensity
                 ])
                 contour = ax.contourf(X*1e3, Y*1e3, intensity, levels=levels, 
-                                     cmap='plasma', vmin=0.001, vmax=1)
+                                     cmap='nipy_spectral', vmin=0.001, vmax=1)
                 
                 ax.set_xlabel('X (mm)', fontsize=11, weight='bold')
                 ax.set_ylabel('Y (mm)', fontsize=11, weight='bold')
@@ -1539,7 +2165,7 @@ class BeamPropagationGUI(QMainWindow):
             # Generate images for each M² measurement position
             for idx, z_pos in enumerate(z_positions):
                 # Create fresh temp tool for this position
-                temp_tool = BeamPropagationTool(
+                temp_tool = BeamPropagationTool(verbose=False, 
                     w0=params['w0'],
                     wavelength=params['wavelength'],
                     grid_size=params['grid_size'],
@@ -1578,7 +2204,7 @@ class BeamPropagationGUI(QMainWindow):
                 
                 # Propagate to target z
                 temp_tool.propagate_to(z_pos)
-                field = temp_tool.current_field
+                field = to_cpu(temp_tool.current_field)
                 
                 # Calculate intensity and phase
                 intensity = np.abs(field)**2
@@ -1592,15 +2218,12 @@ class BeamPropagationGUI(QMainWindow):
                 wx = self.m2_data['wx_array'][idx]
                 wy = self.m2_data['wy_array'][idx]
                 
-                # Crop to 4×FWHM
-                fwhm_x = 1.177 * wx
-                fwhm_y = 1.177 * wy
-                crop_x = 4 * fwhm_x
-                crop_y = 4 * fwhm_y
+                # Crop to half the total aperture for better visibility
+                half_aperture = temp_tool.L / 4  # L/2 is half aperture, /2 again for +/- range
                 
                 # Find indices for cropping
-                x_mask = np.abs(x) <= crop_x / 2
-                y_mask = np.abs(y) <= crop_y / 2
+                x_mask = np.abs(x) <= half_aperture
+                y_mask = np.abs(y) <= half_aperture
                 
                 # Crop arrays
                 x_crop = x[x_mask]
@@ -1616,7 +2239,7 @@ class BeamPropagationGUI(QMainWindow):
                     
                     # Intensity
                     ax_int.imshow(intensity_crop, extent=extent_crop, origin='lower', 
-                                 cmap='plasma', aspect='equal', vmin=0.001, vmax=1)
+                                 cmap='nipy_spectral', aspect='equal', vmin=0.001, vmax=1)
                     ax_int.set_title(f'z={z_pos*1e3:.0f}mm\nIntensity', fontsize=8)
                     ax_int.axis('off')
                     
@@ -1629,7 +2252,7 @@ class BeamPropagationGUI(QMainWindow):
                 elif display_type == "Intensity":
                     ax = self.m2_images_canvas.fig.add_subplot(nrows, ncols, idx + 1)
                     ax.imshow(intensity_crop, extent=extent_crop, origin='lower',
-                             cmap='plasma', aspect='equal', vmin=0.001, vmax=1)
+                             cmap='nipy_spectral', aspect='equal', vmin=0.001, vmax=1)
                     
                     ax.set_title(f'z={z_pos*1e3:.0f}mm\nwx={wx*1e6:.0f}µm, wy={wy*1e6:.0f}µm', 
                                fontsize=8)
@@ -1694,7 +2317,7 @@ class BeamPropagationGUI(QMainWindow):
             # Generate images
             for idx, z_pos in enumerate(z_positions):
                 # Create fresh temp tool for this position
-                temp_tool = BeamPropagationTool(
+                temp_tool = BeamPropagationTool(verbose=False, 
                     w0=params['w0'],
                     wavelength=params['wavelength'],
                     grid_size=params['grid_size'],
@@ -1733,7 +2356,7 @@ class BeamPropagationGUI(QMainWindow):
                 
                 # Propagate to target z
                 temp_tool.propagate_to(z_pos)
-                field = temp_tool.current_field
+                field = to_cpu(temp_tool.current_field)
                 
                 # Calculate intensity and phase
                 intensity = np.abs(field)**2
@@ -1743,12 +2366,12 @@ class BeamPropagationGUI(QMainWindow):
                 x = temp_tool.x
                 y = temp_tool.y
                 
-                # Calculate beam width and crop to 4×FWHM
+                # Calculate beam width and crop to 8×FWHM (for 45° astigmatic beams)
                 wx, wy = compute_beam_width(intensity, x, y)
                 fwhm_x = 1.177 * wx
                 fwhm_y = 1.177 * wy
-                crop_x = 4 * fwhm_x
-                crop_y = 4 * fwhm_y
+                crop_x = 12 * fwhm_x
+                crop_y = 12 * fwhm_y
                 
                 # Find indices for cropping
                 x_mask = np.abs(x) <= crop_x / 2
@@ -1769,7 +2392,7 @@ class BeamPropagationGUI(QMainWindow):
                     
                     # Intensity
                     ax_int.imshow(intensity_crop, extent=extent_crop, origin='lower', 
-                                 cmap='plasma', aspect='equal', vmin=0.001, vmax=1)
+                                 cmap='nipy_spectral', aspect='equal', vmin=0.001, vmax=1)
                     ax_int.set_title(f'z={z_pos*1e3:.0f}mm\nIntensity', fontsize=8)
                     ax_int.axis('off')
                     
@@ -1782,7 +2405,7 @@ class BeamPropagationGUI(QMainWindow):
                 elif display_type == "Intensity":
                     ax = self.gallery_canvas.fig.add_subplot(nrows, ncols, idx + 1)
                     ax.imshow(intensity_crop, extent=extent_crop, origin='lower',
-                             cmap='plasma', aspect='equal', vmin=0.001, vmax=1)
+                             cmap='nipy_spectral', aspect='equal', vmin=0.001, vmax=1)
                     
                     ax.set_title(f'z={z_pos*1e3:.0f}mm\nwx={wx*1e6:.0f}µm, wy={wy*1e6:.0f}µm', 
                                fontsize=8)
@@ -1810,6 +2433,433 @@ class BeamPropagationGUI(QMainWindow):
             print(f"Error updating beam gallery: {e}")
             import traceback
             traceback.print_exc()
+
+    def generate_zernike_reference(self):
+        """Generate reference plots showing common Zernike polynomials"""
+        
+        from Zernike import zernike_polynomial
+        import io
+        from PyQt5.QtGui import QPixmap
+        
+        # Create grid for Zernike calculation
+        N = 256
+        x = np.linspace(-1, 1, N)
+        y = np.linspace(-1, 1, N)
+        X, Y = np.meshgrid(x, y)
+        R = np.sqrt(X**2 + Y**2)
+        Theta = np.arctan2(Y, X)
+        
+        # Mask outside unit circle
+        mask = R <= 1.0
+        
+        # Define Zernike modes to display with descriptions
+        # Format: (n, m, name, description)
+        self.zernike_modes = [
+            (0, 0, "Piston", "Z(0,0)\nConstant phase"),
+            (1, 1, "Tilt X", "Z(1,1)\nHorizontal tilt"),
+            (1, -1, "Tilt Y", "Z(1,-1)\nVertical tilt"),
+            (2, 0, "Defocus", "Z(2,0)\nFocus shift"),
+            (2, 2, "Astig 0°", "Z(2,2)\nAstigmatism 0°/90°"),
+            (2, -2, "Astig 45°", "Z(2,-2)\nAstigmatism ±45°"),
+            (3, 1, "Coma X", "Z(3,1)\nHorizontal coma"),
+            (3, -1, "Coma Y", "Z(3,-1)\nVertical coma"),
+            (3, 3, "Trefoil X", "Z(3,3)\nTrefoil 0°"),
+            (3, -3, "Trefoil Y", "Z(3,-3)\nTrefoil 30°"),
+            (4, 0, "Spherical", "Z(4,0)\nSpherical aberration"),
+            (4, 2, "2nd Astig 0°", "Z(4,2)\nSecondary astig 0°"),
+            (4, -2, "2nd Astig 45°", "Z(4,-2)\nSecondary astig 45°"),
+            (5, 1, "2nd Coma X", "Z(5,1)\nSecondary coma X"),
+            (5, -1, "2nd Coma Y", "Z(5,-1)\nSecondary coma Y"),
+            (6, 0, "2nd Spherical", "Z(6,0)\nSecondary spherical"),
+        ]
+        
+        # Store subplot axes positions for hover detection
+        self.zernike_axes = []
+        
+        # Pre-generate 3D hover images
+        self.zernike_3d_images = {}
+        
+        # Clear canvas
+        self.zernike_canvas.fig.clear()
+        
+        # Create subplot grid (4 rows x 4 cols)
+        nrows, ncols = 4, 4
+        
+        # Higher resolution grid for 3D plots (smoother surfaces)
+        N_3d = 100
+        x_3d = np.linspace(-1, 1, N_3d)
+        y_3d = np.linspace(-1, 1, N_3d)
+        X_3d, Y_3d = np.meshgrid(x_3d, y_3d)
+        R_3d = np.sqrt(X_3d**2 + Y_3d**2)
+        Theta_3d = np.arctan2(Y_3d, X_3d)
+        mask_3d = R_3d <= 1.0
+        
+        print("Generating Zernike reference plots and 3D hover images...")
+        
+        for idx, (n, m, name, description) in enumerate(self.zernike_modes):
+            ax = self.zernike_canvas.fig.add_subplot(nrows, ncols, idx + 1)
+            self.zernike_axes.append(ax)
+            
+            # Calculate Zernike polynomial (high res for 2D plot)
+            Z = zernike_polynomial(n, m, R, Theta)
+            
+            # Apply circular mask
+            Z_masked = np.ma.masked_where(~mask, Z)
+            
+            # Plot 2D
+            im = ax.imshow(Z_masked, extent=[-1, 1, -1, 1], origin='lower',
+                          cmap='RdBu_r', aspect='equal', vmin=-2, vmax=2)
+            
+            # Add unit circle outline
+            theta_circle = np.linspace(0, 2*np.pi, 100)
+            ax.plot(np.cos(theta_circle), np.sin(theta_circle), 'k-', linewidth=1)
+            
+            ax.set_title(f'{name}\n{description}', fontsize=9, weight='bold')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_xlim(-1.1, 1.1)
+            ax.set_ylim(-1.1, 1.1)
+            
+            # Pre-generate 3D plot for hover
+            Z_3d = zernike_polynomial(n, m, R_3d, Theta_3d)
+            Z_3d_masked = np.where(mask_3d, Z_3d, np.nan)
+            
+            # Create 3D figure
+            fig_3d = Figure(figsize=(6, 5), dpi=100)
+            ax_3d = fig_3d.add_subplot(111, projection='3d')
+            
+            # Plot surface with higher resolution and smoother appearance
+            surf = ax_3d.plot_surface(X_3d, Y_3d, Z_3d_masked, 
+                                      cmap='RdBu_r', antialiased=True,
+                                      vmin=-2, vmax=2, alpha=0.95,
+                                      rstride=1, cstride=1,  # Smooth surface
+                                      linewidth=0, edgecolor='none')  # No grid lines
+            
+            ax_3d.set_xlabel('X', fontsize=10)
+            ax_3d.set_ylabel('Y', fontsize=10)
+            ax_3d.set_zlabel('Wavefront', fontsize=10)
+            ax_3d.set_title(f'{name}\n{description.replace(chr(10), " - ")}', 
+                           fontsize=12, weight='bold')
+            ax_3d.set_zlim(-2.5, 2.5)
+            ax_3d.view_init(elev=30, azim=45)
+            
+            # Remove grid and panes for cleaner look
+            ax_3d.grid(False)
+            ax_3d.xaxis.pane.fill = False
+            ax_3d.yaxis.pane.fill = False
+            ax_3d.zaxis.pane.fill = False
+            ax_3d.xaxis.pane.set_edgecolor('lightgray')
+            ax_3d.yaxis.pane.set_edgecolor('lightgray')
+            ax_3d.zaxis.pane.set_edgecolor('lightgray')
+            
+            # Add colorbar
+            fig_3d.colorbar(surf, ax=ax_3d, shrink=0.6, aspect=10, label='Wavefront')
+            
+            fig_3d.tight_layout()
+            
+            # Render to QPixmap
+            buf = io.BytesIO()
+            fig_3d.savefig(buf, format='png', bbox_inches='tight', facecolor='white')
+            buf.seek(0)
+            
+            pixmap = QPixmap()
+            pixmap.loadFromData(buf.read())
+            
+            self.zernike_3d_images[idx] = pixmap
+            
+            buf.close()
+            plt.close(fig_3d)
+        
+        print(f"  Generated {len(self.zernike_3d_images)} 3D hover images")
+        
+        # Add colorbar
+        cbar_ax = self.zernike_canvas.fig.add_axes([0.92, 0.15, 0.02, 0.7])
+        cbar = self.zernike_canvas.fig.colorbar(im, cax=cbar_ax)
+        cbar.set_label('Wavefront (normalized)', fontsize=10)
+        
+        # Main title
+        self.zernike_canvas.fig.suptitle(
+            'Zernike Polynomial Reference (OSA/ANSI Standard)\n'
+            'Red = positive wavefront, Blue = negative wavefront | Hover for 3D view',
+            fontsize=12, weight='bold', y=0.98
+        )
+        
+        self.zernike_canvas.fig.tight_layout(rect=[0, 0, 0.9, 0.93])
+        self.zernike_canvas.draw()
+
+    def on_zernike_hover(self, event):
+        """Handle hover over Zernike plots to show 3D view"""
+        
+        if event.inaxes is None:
+            self.hide_zernike_hover()
+            return
+        
+        # Find which subplot we're hovering over
+        for idx, ax in enumerate(self.zernike_axes):
+            if event.inaxes == ax:
+                self.show_zernike_3d_popup(idx, event)
+                return
+        
+        self.hide_zernike_hover()
+    
+    def on_zernike_leave(self, event):
+        """Hide hover popup when leaving axes"""
+        self.hide_zernike_hover()
+    
+    def get_smart_popup_position(self, popup_width, popup_height, margin=20):
+        """
+        Calculate smart popup position based on cursor quadrant.
+        
+        If cursor is in:
+        - Bottom-left quadrant: popup appears top-right of cursor
+        - Bottom-right quadrant: popup appears top-left of cursor
+        - Top-left quadrant: popup appears bottom-right of cursor
+        - Top-right quadrant: popup appears bottom-left of cursor
+        
+        Returns (x, y) position in local widget coordinates.
+        """
+        cursor_pos = QCursor.pos()
+        local_pos = self.mapFromGlobal(cursor_pos)
+        
+        window_width = self.width()
+        window_height = self.height()
+        
+        # Determine which quadrant the cursor is in
+        in_left_half = local_pos.x() < window_width / 2
+        in_top_half = local_pos.y() < window_height / 2
+        
+        # Calculate position based on quadrant
+        if in_left_half and not in_top_half:
+            # Bottom-left: popup goes top-right
+            x = local_pos.x() + margin
+            y = local_pos.y() - popup_height - margin
+        elif not in_left_half and not in_top_half:
+            # Bottom-right: popup goes top-left
+            x = local_pos.x() - popup_width - margin
+            y = local_pos.y() - popup_height - margin
+        elif in_left_half and in_top_half:
+            # Top-left: popup goes bottom-right
+            x = local_pos.x() + margin
+            y = local_pos.y() + margin
+        else:
+            # Top-right: popup goes bottom-left
+            x = local_pos.x() - popup_width - margin
+            y = local_pos.y() + margin
+        
+        # Ensure popup stays within window bounds
+        x = max(5, min(x, window_width - popup_width - 5))
+        y = max(5, min(y, window_height - popup_height - 5))
+        
+        return x, y
+    
+    def show_zernike_3d_popup(self, idx, event):
+        """Show 3D popup for Zernike mode"""
+        
+        if idx not in self.zernike_3d_images:
+            return
+        
+        pixmap = self.zernike_3d_images[idx]
+        
+        # Create or update hover label
+        if self.zernike_hover_label is None:
+            self.zernike_hover_label = QLabel(self)
+            self.zernike_hover_label.setStyleSheet("""
+                QLabel {
+                    background-color: white;
+                    border: 2px solid #333;
+                    border-radius: 5px;
+                    padding: 5px;
+                }
+            """)
+        
+        self.zernike_hover_label.setPixmap(pixmap)
+        self.zernike_hover_label.adjustSize()
+        
+        # Use smart positioning
+        x, y = self.get_smart_popup_position(pixmap.width() + 10, pixmap.height() + 10)
+        
+        self.zernike_hover_label.move(x, y)
+        self.zernike_hover_label.show()
+        self.zernike_hover_label.raise_()
+    
+    def hide_zernike_hover(self):
+        """Hide Zernike 3D hover popup"""
+        if self.zernike_hover_label is not None:
+            self.zernike_hover_label.hide()
+    
+    def on_m2_hover(self, event):
+        """Handle hover over M² plot to show beam profile"""
+        
+        if not hasattr(self, 'm2_data') or self.m2_data is None:
+            return
+        
+        if event.inaxes is None:
+            self.hide_m2_hover()
+            return
+        
+        # Check if we're near a data point
+        z_array = self.m2_data['z_array']
+        
+        if event.xdata is None:
+            self.hide_m2_hover()
+            return
+        
+        # Find nearest z position (x-axis is in mm)
+        z_hover = event.xdata * 1e-3  # Convert mm to m
+        
+        # Find closest data point
+        distances = np.abs(z_array - z_hover)
+        idx = np.argmin(distances)
+        
+        # Only show if within reasonable distance (5% of range)
+        z_range = z_array[-1] - z_array[0]
+        if distances[idx] > z_range * 0.05:
+            self.hide_m2_hover()
+            return
+        
+        self.show_m2_beam_popup(idx)
+    
+    def on_m2_leave(self, event):
+        """Hide M² hover popup when leaving axes"""
+        self.hide_m2_hover()
+    
+    def show_m2_beam_popup(self, idx):
+        """Show intensity and phase popup for M² measurement point"""
+        
+        if not hasattr(self, 'worker') or self.worker is None:
+            return
+        if not hasattr(self.worker, 'tool') or self.worker.tool is None:
+            return
+        
+        try:
+            tool = self.worker.tool
+            m2_data = self.m2_data
+            
+            z_pos = m2_data['z_array'][idx]
+            wx = m2_data['wx_array'][idx]
+            wy = m2_data['wy_array'][idx]
+            
+            # Get field at M² lens position and propagate to this z
+            # We need to recalculate since we don't store all fields
+            z_m2_lens = m2_data['z_m2_lens']
+            
+            # Check if we have the field cached
+            if not hasattr(self, '_m2_hover_cache'):
+                self._m2_hover_cache = {}
+            
+            cache_key = f"{idx}"
+            
+            if cache_key not in self._m2_hover_cache:
+                # Need to propagate to get the field
+                # This is a simplified approach - we re-propagate from stored state
+                from Zernike import propagate_angular_spectrum
+                
+                # Get field at M² lens (we need to store this during simulation)
+                if hasattr(self, '_field_at_m2_lens'):
+                    dz = z_pos - z_m2_lens
+                    field = propagate_angular_spectrum(
+                        self._field_at_m2_lens, 
+                        tool.wavelength, 
+                        tool.dx, 
+                        dz
+                    )
+                    
+                    # Ensure field is on CPU
+                    field = to_cpu(field)
+                    
+                    # Create popup image
+                    intensity = np.abs(field)**2
+                    intensity_norm = intensity / np.max(intensity)
+                    phase = np.angle(field)
+                    
+                    # Crop to 5× FWHM for better visibility
+                    fwhm_x = 1.177 * wx
+                    fwhm_y = 1.177 * wy
+                    crop_half_x = 2.5 * fwhm_x  # 5× total = 2.5× on each side
+                    crop_half_y = 2.5 * fwhm_y
+                    
+                    x = tool.x
+                    y = tool.y
+                    x_mask = np.abs(x) <= crop_half_x
+                    y_mask = np.abs(y) <= crop_half_y
+                    
+                    x_crop = x[x_mask]
+                    y_crop = y[y_mask]
+                    intensity_crop = intensity_norm[np.ix_(y_mask, x_mask)]
+                    phase_crop = phase[np.ix_(y_mask, x_mask)]
+                    extent = [x_crop[0]*1e3, x_crop[-1]*1e3, y_crop[0]*1e3, y_crop[-1]*1e3]
+                    
+                    # Create figure with intensity and phase
+                    fig = Figure(figsize=(8, 4), dpi=100)
+                    
+                    ax1 = fig.add_subplot(121)
+                    im1 = ax1.imshow(intensity_crop, extent=extent, origin='lower',
+                                    cmap='nipy_spectral', aspect='equal', vmin=0.001, vmax=1)
+                    ax1.set_title(f'Intensity\nz={z_pos*1e3:.1f}mm', fontsize=10, weight='bold')
+                    ax1.set_xlabel('x (mm)', fontsize=9)
+                    ax1.set_ylabel('y (mm)', fontsize=9)
+                    fig.colorbar(im1, ax=ax1, shrink=0.8)
+                    
+                    ax2 = fig.add_subplot(122)
+                    im2 = ax2.imshow(phase_crop, extent=extent, origin='lower',
+                                    cmap='twilight', aspect='equal', vmin=-np.pi, vmax=np.pi)
+                    ax2.set_title(f'Phase\nwx={wx*1e6:.0f}µm, wy={wy*1e6:.0f}µm', fontsize=10, weight='bold')
+                    ax2.set_xlabel('x (mm)', fontsize=9)
+                    ax2.set_ylabel('y (mm)', fontsize=9)
+                    fig.colorbar(im2, ax=ax2, shrink=0.8, label='rad')
+                    
+                    fig.tight_layout()
+                    
+                    # Convert to QPixmap
+                    import io
+                    from PyQt5.QtGui import QPixmap
+                    
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format='png', bbox_inches='tight', facecolor='white', dpi=100)
+                    buf.seek(0)
+                    
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(buf.read())
+                    buf.close()
+                    plt.close(fig)
+                    
+                    self._m2_hover_cache[cache_key] = pixmap
+                else:
+                    return
+            
+            pixmap = self._m2_hover_cache[cache_key]
+            
+            # Create or update hover label
+            if self.m2_hover_label is None:
+                self.m2_hover_label = QLabel(self)
+                self.m2_hover_label.setStyleSheet("""
+                    QLabel {
+                        background-color: white;
+                        border: 2px solid #333;
+                        border-radius: 5px;
+                        padding: 5px;
+                    }
+                """)
+            
+            self.m2_hover_label.setPixmap(pixmap)
+            self.m2_hover_label.adjustSize()
+            
+            # Use smart positioning
+            x, y = self.get_smart_popup_position(pixmap.width() + 10, pixmap.height() + 10)
+            
+            self.m2_hover_label.move(x, y)
+            self.m2_hover_label.show()
+            self.m2_hover_label.raise_()
+            
+        except Exception as e:
+            print(f"M² hover error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def hide_m2_hover(self):
+        """Hide M² hover popup"""
+        if self.m2_hover_label is not None:
+            self.m2_hover_label.hide()
 
 
 def main():
