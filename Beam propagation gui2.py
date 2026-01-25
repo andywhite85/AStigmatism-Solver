@@ -204,40 +204,104 @@ class SimulationWorker(QThread):
                 'wy_array': wy_array[sort_idx]
             }
             
-            # Pre-calculate beam profiles for hover feature
-            # Use the field_at_m2_lens which is already stored by setup_m2_measurement
-            self.progress.emit("Pre-calculating beam profiles for hover...")
+            # Pre-calculate beam profiles for ALL features using field_at_m2_lens
+            # This ensures consistency between hover, M² images tab, and beam gallery
+            self.progress.emit("Pre-rendering beam images...")
             self.hover_fields = {}
+            self.m2_images_cache = {}  # Pre-rendered M² measurement images
+            self.gallery_images_cache = {}  # Pre-rendered gallery images
             
             # Get the stored field at M² lens position
             if hasattr(self.tool, 'field_at_m2_lens'):
                 field_at_m2_lens = to_cpu(self.tool.field_at_m2_lens)
                 z_m2_lens = self.m2_data['z_m2_lens']
                 
-                # Sample hover positions across the M² measurement range
-                n_hover_samples = min(30, len(self.m2_data['z_array']))
-                hover_z_positions = np.linspace(
-                    self.m2_data['z_array'][0], 
-                    self.m2_data['z_array'][-1], 
-                    n_hover_samples
-                )
+                # 1. Pre-render M² measurement position images (for M² Images tab)
+                self.progress.emit("Pre-rendering M² measurement images...")
+                m2_z_positions = self.m2_data['z_array']
                 
-                # Propagate from the M² lens position to each hover position
-                for i, z_pos in enumerate(hover_z_positions):
+                for i, z_pos in enumerate(m2_z_positions):
                     dz = z_pos - z_m2_lens
                     field_z = propagate_angular_spectrum(
                         field_at_m2_lens,
                         self.tool.wavelength,
                         self.tool.dx,
                         dz,
-                        use_gpu=False  # Keep on CPU for storage
+                        use_gpu=False
                     )
+                    field_cpu = to_cpu(field_z)
                     
-                    # Store CPU version
-                    self.hover_fields[z_pos] = to_cpu(field_z)
+                    # Calculate intensity and phase
+                    intensity = np.abs(field_cpu)**2
+                    intensity_norm = intensity / np.max(intensity)
+                    phase = np.angle(field_cpu)
+                    
+                    # Get beam widths for this position
+                    wx = self.m2_data['wx_array'][i]
+                    wy = self.m2_data['wy_array'][i]
+                    
+                    # Store data for M² images tab
+                    self.m2_images_cache[i] = {
+                        'z_pos': z_pos,
+                        'intensity': intensity_norm,
+                        'phase': phase,
+                        'wx': wx,
+                        'wy': wy,
+                        'x': self.tool.x,
+                        'y': self.tool.y,
+                        'L': self.tool.L
+                    }
+                    
+                    # Also store field for hover
+                    self.hover_fields[z_pos] = field_cpu
+                    
+                    if (i + 1) % 5 == 0:
+                        self.progress.emit(f"Pre-rendering M² images... {i+1}/{len(m2_z_positions)}")
+                
+                # 2. Pre-render gallery images at regular intervals (for Beam Gallery tab)
+                # Use more points for smoother gallery selection
+                self.progress.emit("Pre-rendering gallery images...")
+                n_gallery_samples = 25  # Fixed number of pre-rendered gallery images
+                gallery_z_positions = np.linspace(
+                    m2_z_positions[0], 
+                    m2_z_positions[-1], 
+                    n_gallery_samples
+                )
+                
+                for i, z_pos in enumerate(gallery_z_positions):
+                    # Skip if we already have this position from M² images
+                    dz = z_pos - z_m2_lens
+                    field_z = propagate_angular_spectrum(
+                        field_at_m2_lens,
+                        self.tool.wavelength,
+                        self.tool.dx,
+                        dz,
+                        use_gpu=False
+                    )
+                    field_cpu = to_cpu(field_z)
+                    
+                    # Calculate intensity and phase
+                    intensity = np.abs(field_cpu)**2
+                    intensity_norm = intensity / np.max(intensity)
+                    phase = np.angle(field_cpu)
+                    
+                    # Calculate beam width
+                    wx, wy = compute_beam_width(intensity, self.tool.x, self.tool.y)
+                    
+                    # Store data for gallery
+                    self.gallery_images_cache[i] = {
+                        'z_pos': z_pos,
+                        'intensity': intensity_norm,
+                        'phase': phase,
+                        'wx': wx,
+                        'wy': wy,
+                        'x': self.tool.x,
+                        'y': self.tool.y,
+                        'L': self.tool.L
+                    }
                     
                     if (i + 1) % 10 == 0:
-                        self.progress.emit(f"Pre-calculating hover images... {i+1}/{n_hover_samples}")
+                        self.progress.emit(f"Pre-rendering gallery images... {i+1}/{n_gallery_samples}")
             
             self.progress.emit("Simulation complete!")
             self.finished.emit()
@@ -701,6 +765,26 @@ class BeamPropagationGUI(QMainWindow):
         # Tab 1: M² Measurement
         self.m2_tab = QWidget()
         m2_layout = QVBoxLayout(self.m2_tab)
+        
+        # Add control bar for axis selection
+        m2_control_frame = QFrame()
+        m2_control_layout = QHBoxLayout(m2_control_frame)
+        m2_control_layout.setContentsMargins(5, 5, 5, 5)
+        
+        m2_control_layout.addWidget(QLabel("Display axes:"))
+        self.m2_axis_combo = QComboBox()
+        self.m2_axis_combo.addItems(["X / Y", "Major / Minor"])
+        self.m2_axis_combo.setCurrentText("X / Y")
+        self.m2_axis_combo.currentTextChanged.connect(self.plot_m2_results)
+        m2_control_layout.addWidget(self.m2_axis_combo)
+        
+        m2_control_layout.addWidget(QLabel("  |  "))
+        m2_info = QLabel("(Hover over data points to see beam profile)")
+        m2_info.setStyleSheet("color: gray; font-style: italic;")
+        m2_control_layout.addWidget(m2_info)
+        m2_control_layout.addStretch()
+        
+        m2_layout.addWidget(m2_control_frame)
         
         self.m2_canvas = MplCanvas(self, width=10, height=8, dpi=100)
         self.m2_toolbar = NavigationToolbar(self.m2_canvas, self)
@@ -1478,6 +1562,10 @@ class BeamPropagationGUI(QMainWindow):
         self.hover_fields = self.worker.hover_fields
         params = self.worker.params
         
+        # Store pre-rendered image caches
+        self.m2_images_cache = getattr(self.worker, 'm2_images_cache', {})
+        self.gallery_images_cache = getattr(self.worker, 'gallery_images_cache', {})
+        
         # Store field at M² lens for M² hover functionality
         if hasattr(self.tool, 'field_at_m2_lens'):
             self._field_at_m2_lens = self.tool.field_at_m2_lens
@@ -1698,87 +1786,133 @@ class BeamPropagationGUI(QMainWindow):
     def plot_m2_results(self):
         """Plot M² measurement results"""
         
+        if not hasattr(self, 'm2_data') or self.m2_data is None:
+            return
+        
         # Clear previous plot
         self.m2_canvas.fig.clear()
         
         ax = self.m2_canvas.fig.add_subplot(111)
         
         z_array = self.m2_data['z_array']
-        wx_array = self.m2_data['wx_array']
-        wy_array = self.m2_data['wy_array']
+        
+        # Get display mode
+        axis_mode = self.m2_axis_combo.currentText() if hasattr(self, 'm2_axis_combo') else "X / Y"
+        
+        if axis_mode == "Major / Minor" and 'w_major_array' in self.m2_data:
+            # Plot Major/Minor data
+            w1_array = self.m2_data['w_major_array']
+            w2_array = self.m2_data['w_minor_array']
+            z_focus_1 = self.m2_data['z_focus_major']
+            z_focus_2 = self.m2_data['z_focus_minor']
+            w0_1 = self.m2_data['w0_major']
+            w0_2 = self.m2_data['w0_minor']
+            zR_1 = self.m2_data['zR_major']
+            zR_2 = self.m2_data['zR_minor']
+            M2_1 = self.m2_data['M2_major']
+            M2_2 = self.m2_data['M2_minor']
+            label1, label2 = 'Major', 'Minor'
+            color1, color2 = 'green', 'purple'
+            title = 'M² Measurement Results (Principal Axes)'
+        else:
+            # Plot X/Y data
+            w1_array = self.m2_data['wx_array']
+            w2_array = self.m2_data['wy_array']
+            z_focus_1 = self.m2_data['z_focus_x']
+            z_focus_2 = self.m2_data['z_focus_y']
+            w0_1 = self.m2_data['w0_x']
+            w0_2 = self.m2_data['w0_y']
+            zR_1 = self.m2_data['zR_x']
+            zR_2 = self.m2_data['zR_y']
+            M2_1 = self.m2_data['M2_x']
+            M2_2 = self.m2_data['M2_y']
+            label1, label2 = 'X', 'Y'
+            color1, color2 = 'blue', 'red'
+            title = 'M² Measurement Results (X/Y Axes)'
         
         # Plot measured points
-        ax.plot(z_array*1e3, wx_array*1e6, 'bo', markersize=8, label='wx measured', zorder=3)
-        ax.plot(z_array*1e3, wy_array*1e6, 'rs', markersize=8, label='wy measured', zorder=3)
+        ax.plot(z_array*1e3, w1_array*1e6, 'o', color=color1, markersize=8, 
+                label=f'w{label1.lower()} measured', zorder=3)
+        ax.plot(z_array*1e3, w2_array*1e6, 's', color=color2, markersize=8, 
+                label=f'w{label2.lower()} measured', zorder=3)
         
         # Plot fits
         z_fit = np.linspace(z_array[0], z_array[-1], 200)
         
-        # X fit
-        theta_x = self.m2_data['M2_x'] * self.tool.wavelength / (np.pi * self.m2_data['w0_x'])
-        wx_fit = np.sqrt(self.m2_data['w0_x']**2 + 
-                        (theta_x * (z_fit - self.m2_data['z_focus_x']))**2)
-        ax.plot(z_fit*1e3, wx_fit*1e6, 'b-', linewidth=2, 
-               label=f"wx fit (M²={self.m2_data['M2_x']:.3f})", zorder=2)
+        # First axis fit
+        theta_1 = M2_1 * self.tool.wavelength / (np.pi * w0_1)
+        w1_fit = np.sqrt(w0_1**2 + (theta_1 * (z_fit - z_focus_1))**2)
+        ax.plot(z_fit*1e3, w1_fit*1e6, '-', color=color1, linewidth=2, 
+               label=f"w{label1.lower()} fit (M²={M2_1:.3f})", zorder=2)
         
-        # Y fit
-        theta_y = self.m2_data['M2_y'] * self.tool.wavelength / (np.pi * self.m2_data['w0_y'])
-        wy_fit = np.sqrt(self.m2_data['w0_y']**2 + 
-                        (theta_y * (z_fit - self.m2_data['z_focus_y']))**2)
-        ax.plot(z_fit*1e3, wy_fit*1e6, 'r-', linewidth=2,
-               label=f"wy fit (M²={self.m2_data['M2_y']:.3f})", zorder=2)
+        # Second axis fit
+        theta_2 = M2_2 * self.tool.wavelength / (np.pi * w0_2)
+        w2_fit = np.sqrt(w0_2**2 + (theta_2 * (z_fit - z_focus_2))**2)
+        ax.plot(z_fit*1e3, w2_fit*1e6, '-', color=color2, linewidth=2,
+               label=f"w{label2.lower()} fit (M²={M2_2:.3f})", zorder=2)
         
         # Mark focus locations
-        ax.axvline(self.m2_data['z_focus_x']*1e3, color='blue', linestyle='--', 
-                  alpha=0.5, linewidth=2, label=f"Focus X: {self.m2_data['z_focus_x']*1e3:.1f}mm")
-        ax.axvline(self.m2_data['z_focus_y']*1e3, color='red', linestyle='--',
-                  alpha=0.5, linewidth=2, label=f"Focus Y: {self.m2_data['z_focus_y']*1e3:.1f}mm")
+        ax.axvline(z_focus_1*1e3, color=color1, linestyle='--', 
+                  alpha=0.5, linewidth=2, label=f"Focus {label1}: {z_focus_1*1e3:.1f}mm")
+        ax.axvline(z_focus_2*1e3, color=color2, linestyle='--',
+                  alpha=0.5, linewidth=2, label=f"Focus {label2}: {z_focus_2*1e3:.1f}mm")
         
         # Mark Rayleigh ranges
-        ax.axvspan((self.m2_data['z_focus_x'] - self.m2_data['zR_x'])*1e3,
-                  (self.m2_data['z_focus_x'] + self.m2_data['zR_x'])*1e3,
-                  alpha=0.1, color='blue')
-        ax.axvspan((self.m2_data['z_focus_y'] - self.m2_data['zR_y'])*1e3,
-                  (self.m2_data['z_focus_y'] + self.m2_data['zR_y'])*1e3,
-                  alpha=0.1, color='red')
+        ax.axvspan((z_focus_1 - zR_1)*1e3, (z_focus_1 + zR_1)*1e3,
+                  alpha=0.1, color=color1)
+        ax.axvspan((z_focus_2 - zR_2)*1e3, (z_focus_2 + zR_2)*1e3,
+                  alpha=0.1, color=color2)
         
         ax.set_xlabel('Propagation distance z (mm)', fontsize=11, weight='bold')
         ax.set_ylabel('Beam width (µm)', fontsize=11, weight='bold')
-        ax.set_title('M² Measurement Results', fontsize=13, weight='bold')
+        ax.set_title(title, fontsize=13, weight='bold')
         ax.legend(fontsize=9, loc='upper left')
         ax.grid(True, alpha=0.3)
         
         # Add astigmatism and asymmetry analysis text box
-        astig_total = self.m2_data.get('astigmatism_total', abs(self.m2_data['z_focus_x'] - self.m2_data['z_focus_y']))
+        astig_total = self.m2_data.get('astigmatism_total', abs(z_focus_1 - z_focus_2))
         astig_0 = self.m2_data.get('astig_0_deg', astig_total)
         astig_45 = self.m2_data.get('astig_45_deg', 0)
         astig_waves = self.m2_data.get('astig_waves', 0)
-        asymmetry = self.m2_data.get('asymmetry_ratio', max(self.m2_data['w0_x'], self.m2_data['w0_y']) / min(self.m2_data['w0_x'], self.m2_data['w0_y']))
-        ellip_x = self.m2_data.get('ellipticity_at_x_focus', 1.0)
-        ellip_y = self.m2_data.get('ellipticity_at_y_focus', 1.0)
+        asymmetry = self.m2_data.get('asymmetry_ratio', max(w0_1, w0_2) / min(w0_1, w0_2) if min(w0_1, w0_2) > 0 else 1.0)
         
-        # Build analysis text
-        analysis_text = (
-            f"ASTIGMATISM ANALYSIS\n"
-            f"{'─'*24}\n"
-            f"Total: {astig_total*1e3:.3f} mm\n"
-            f"0° (X-Y): {astig_0*1e3:.3f} mm\n"
-            f"45°: {astig_45*1e3:.3f} mm\n"
-            f"~{astig_waves:.2f} waves\n"
-            f"\n"
-            f"ASYMMETRY ANALYSIS\n"
-            f"{'─'*24}\n"
-            f"Waist ratio: {asymmetry:.3f}\n"
-            f"Ellip @ X foc: {ellip_x:.3f}\n"
-            f"Ellip @ Y foc: {ellip_y:.3f}\n"
-            f"\n"
-            f"BEAM PARAMETERS\n"
-            f"{'─'*24}\n"
-            f"w0x: {self.m2_data['w0_x']*1e6:.1f} µm\n"
-            f"w0y: {self.m2_data['w0_y']*1e6:.1f} µm\n"
-            f"zRx: {self.m2_data['zR_x']*1e3:.2f} mm\n"
-            f"zRy: {self.m2_data['zR_y']*1e3:.2f} mm"
-        )
+        # Build analysis text - show both X/Y and Major/Minor if available
+        if 'w0_major' in self.m2_data:
+            analysis_text = (
+                f"ASTIGMATISM\n"
+                f"{'─'*24}\n"
+                f"Total: {astig_total*1e3:.3f} mm\n"
+                f"~{astig_waves:.2f} waves\n"
+                f"\n"
+                f"X/Y PARAMETERS\n"
+                f"{'─'*24}\n"
+                f"w0x: {self.m2_data['w0_x']*1e6:.1f} µm\n"
+                f"w0y: {self.m2_data['w0_y']*1e6:.1f} µm\n"
+                f"M²x: {self.m2_data['M2_x']:.3f}\n"
+                f"M²y: {self.m2_data['M2_y']:.3f}\n"
+                f"\n"
+                f"PRINCIPAL AXES\n"
+                f"{'─'*24}\n"
+                f"w0_maj: {self.m2_data['w0_major']*1e6:.1f} µm\n"
+                f"w0_min: {self.m2_data['w0_minor']*1e6:.1f} µm\n"
+                f"M²_maj: {self.m2_data['M2_major']:.3f}\n"
+                f"M²_min: {self.m2_data['M2_minor']:.3f}\n"
+                f"Angle: {np.mean(self.m2_data['angle_array']):.1f}°"
+            )
+        else:
+            analysis_text = (
+                f"ASTIGMATISM\n"
+                f"{'─'*24}\n"
+                f"Total: {astig_total*1e3:.3f} mm\n"
+                f"~{astig_waves:.2f} waves\n"
+                f"\n"
+                f"BEAM PARAMETERS\n"
+                f"{'─'*24}\n"
+                f"w0{label1.lower()}: {w0_1*1e6:.1f} µm\n"
+                f"w0{label2.lower()}: {w0_2*1e6:.1f} µm\n"
+                f"zR{label1.lower()}: {zR_1*1e3:.2f} mm\n"
+                f"zR{label2.lower()}: {zR_2*1e3:.2f} mm"
+            )
         
         # Add text box on the right side
         props = dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.8)
@@ -2128,18 +2262,17 @@ class BeamPropagationGUI(QMainWindow):
 
 
     def update_m2_images_gallery(self):
-        """Update M² measurement images gallery showing all measurement positions"""
+        """Update M² measurement images gallery using pre-rendered cache"""
         
-        if not hasattr(self, 'tool') or self.tool is None or self.m2_data is None:
+        if not hasattr(self, 'm2_images_cache') or not self.m2_images_cache:
+            print("No M² images cache available")
             return
         
         try:
             # Get parameters
             display_type = self.m2_images_display_combo.currentText()
             
-            # Get M² measurement positions
-            z_positions = self.m2_data['z_array']
-            n_images = len(z_positions)
+            n_images = len(self.m2_images_cache)
             
             # Clear canvas
             self.m2_images_canvas.fig.clear()
@@ -2160,66 +2293,23 @@ class BeamPropagationGUI(QMainWindow):
             else:
                 nrows, ncols = 6, 5
             
-            params = self.worker.params
-            
-            # Generate images for each M² measurement position
-            for idx, z_pos in enumerate(z_positions):
-                # Create fresh temp tool for this position
-                temp_tool = BeamPropagationTool(verbose=False, 
-                    w0=params['w0'],
-                    wavelength=params['wavelength'],
-                    grid_size=params['grid_size'],
-                    physical_size=params['physical_size']
-                )
-                temp_tool.start_fresh(with_current_aberrations=False)
-                
-                # Apply aberrations if past that point
-                if z_pos >= params['z_aberration']:
-                    temp_tool.propagate_to(params['z_aberration'])
+            # Display images from cache
+            for idx in range(n_images):
+                if idx not in self.m2_images_cache:
+                    continue
                     
-                    if params['z22'] != 0:
-                        temp_tool.add_zernike_aberration(2, 2, params['z22'])
-                    if params['z2m2'] != 0:
-                        temp_tool.add_zernike_aberration(2, -2, params['z2m2'])
-                    if params['z31'] != 0:
-                        temp_tool.add_zernike_aberration(3, 1, params['z31'])
-                    if params['z3m1'] != 0:
-                        temp_tool.add_zernike_aberration(3, -1, params['z3m1'])
-                    
-                    if (params['z22'] != 0 or params['z2m2'] != 0 or 
-                        params['z31'] != 0 or params['z3m1'] != 0):
-                        temp_tool.apply_aberrations_at_current_position()
-                        temp_tool.clear_aberrations()
-                
-                # Apply correction if enabled and past corrector
-                if params['enable_correction'] and z_pos >= params['z_corrector']:
-                    temp_tool.propagate_to(params['z_corrector'])
-                    temp_tool.apply_cylindrical_pair_for_astigmatism_correction(
-                        f1=params['f1'],
-                        f2=params['f2'],
-                        spacing=params['spacing'],
-                        angle1_deg=params['angle1'],
-                        angle2_deg=params['angle2']
-                    )
-                
-                # Propagate to target z
-                temp_tool.propagate_to(z_pos)
-                field = to_cpu(temp_tool.current_field)
-                
-                # Calculate intensity and phase
-                intensity = np.abs(field)**2
-                intensity_norm = intensity / np.max(intensity)
-                phase = np.angle(field)
-                
-                x = temp_tool.x
-                y = temp_tool.y
-                
-                # Get measured beam widths for this position
-                wx = self.m2_data['wx_array'][idx]
-                wy = self.m2_data['wy_array'][idx]
+                cache = self.m2_images_cache[idx]
+                z_pos = cache['z_pos']
+                intensity_norm = cache['intensity']
+                phase = cache['phase']
+                wx = cache['wx']
+                wy = cache['wy']
+                x = cache['x']
+                y = cache['y']
+                L = cache['L']
                 
                 # Crop to half the total aperture for better visibility
-                half_aperture = temp_tool.L / 4  # L/2 is half aperture, /2 again for +/- range
+                half_aperture = L / 4
                 
                 # Find indices for cropping
                 x_mask = np.abs(x) <= half_aperture
@@ -2262,8 +2352,8 @@ class BeamPropagationGUI(QMainWindow):
                     
                 else:  # Phase
                     ax = self.m2_images_canvas.fig.add_subplot(nrows, ncols, idx + 1)
-                    im = ax.imshow(phase_crop, extent=extent_crop, origin='lower',
-                                  cmap='twilight', aspect='equal', vmin=-np.pi, vmax=np.pi)
+                    ax.imshow(phase_crop, extent=extent_crop, origin='lower',
+                              cmap='twilight', aspect='equal', vmin=-np.pi, vmax=np.pi)
                     ax.set_title(f'z={z_pos*1e3:.0f}mm\nwx={wx*1e6:.0f}µm, wy={wy*1e6:.0f}µm', 
                                fontsize=8)
                     ax.set_xlabel('x (mm)', fontsize=7)
@@ -2271,7 +2361,9 @@ class BeamPropagationGUI(QMainWindow):
                     ax.tick_params(labelsize=6)
             
             # Add main title
-            title_text = f'M² Measurement: {n_images} positions from z={z_positions[0]*1e3:.0f}mm to z={z_positions[-1]*1e3:.0f}mm'
+            z_start = self.m2_images_cache[0]['z_pos'] if 0 in self.m2_images_cache else 0
+            z_end = self.m2_images_cache[n_images-1]['z_pos'] if (n_images-1) in self.m2_images_cache else 0
+            title_text = f'M² Measurement: {n_images} positions from z={z_start*1e3:.0f}mm to z={z_end*1e3:.0f}mm'
             self.m2_images_canvas.fig.suptitle(title_text, fontsize=12, weight='bold')
             
             self.m2_images_canvas.fig.tight_layout(rect=[0, 0, 1, 0.97])
@@ -2283,99 +2375,76 @@ class BeamPropagationGUI(QMainWindow):
             traceback.print_exc()
 
     def update_beam_gallery(self):
-        """Update beam images gallery showing multiple z positions"""
+        """Update beam images gallery using pre-rendered cache"""
         
-        if not hasattr(self, 'tool') or self.tool is None:
+        if not hasattr(self, 'gallery_images_cache') or not self.gallery_images_cache:
+            print("No gallery images cache available")
             return
         
         try:
             # Get parameters
-            n_images = int(self.n_images_combo.currentText())
+            n_display = int(self.n_images_combo.currentText())
             display_type = self.gallery_display_combo.currentText()
             
-            # Get z range
-            z_array = self.propagation_data['z_array']
-            z_positions = np.linspace(z_array[0], z_array[-1], n_images)
+            # Get total cached images
+            n_cached = len(self.gallery_images_cache)
+            
+            # Select evenly spaced indices from the cache
+            if n_display >= n_cached:
+                # Show all cached images
+                display_indices = list(range(n_cached))
+            else:
+                # Select subset evenly spaced
+                display_indices = [int(i * (n_cached - 1) / (n_display - 1)) for i in range(n_display)]
+            
+            n_images = len(display_indices)
             
             # Clear canvas
             self.gallery_canvas.fig.clear()
             
             # Calculate grid layout
-            if n_images == 6:
+            if n_images <= 6:
                 nrows, ncols = 2, 3
-            elif n_images == 9:
+            elif n_images <= 9:
                 nrows, ncols = 3, 3
-            elif n_images == 12:
+            elif n_images <= 12:
                 nrows, ncols = 3, 4
-            elif n_images == 16:
+            elif n_images <= 16:
                 nrows, ncols = 4, 4
+            elif n_images <= 25:
+                nrows, ncols = 5, 5
             else:
-                nrows, ncols = 3, 3
+                nrows, ncols = 5, 5
             
-            params = self.worker.params
-            
-            # Generate images
-            for idx, z_pos in enumerate(z_positions):
-                # Create fresh temp tool for this position
-                temp_tool = BeamPropagationTool(verbose=False, 
-                    w0=params['w0'],
-                    wavelength=params['wavelength'],
-                    grid_size=params['grid_size'],
-                    physical_size=params['physical_size']
-                )
-                temp_tool.start_fresh(with_current_aberrations=False)
-                
-                # Apply aberrations if past that point
-                if z_pos >= params['z_aberration']:
-                    temp_tool.propagate_to(params['z_aberration'])
+            # Display images from cache
+            for plot_idx, cache_idx in enumerate(display_indices):
+                if cache_idx not in self.gallery_images_cache:
+                    continue
                     
-                    if params['z22'] != 0:
-                        temp_tool.add_zernike_aberration(2, 2, params['z22'])
-                    if params['z2m2'] != 0:
-                        temp_tool.add_zernike_aberration(2, -2, params['z2m2'])
-                    if params['z31'] != 0:
-                        temp_tool.add_zernike_aberration(3, 1, params['z31'])
-                    if params['z3m1'] != 0:
-                        temp_tool.add_zernike_aberration(3, -1, params['z3m1'])
-                    
-                    if (params['z22'] != 0 or params['z2m2'] != 0 or 
-                        params['z31'] != 0 or params['z3m1'] != 0):
-                        temp_tool.apply_aberrations_at_current_position()
-                        temp_tool.clear_aberrations()
+                cache = self.gallery_images_cache[cache_idx]
+                z_pos = cache['z_pos']
+                intensity_norm = cache['intensity']
+                phase = cache['phase']
+                wx = cache['wx']
+                wy = cache['wy']
+                x = cache['x']
+                y = cache['y']
+                L = cache['L']
                 
-                # Apply correction if enabled and past corrector
-                if params['enable_correction'] and z_pos >= params['z_corrector']:
-                    temp_tool.propagate_to(params['z_corrector'])
-                    temp_tool.apply_cylindrical_pair_for_astigmatism_correction(
-                        f1=params['f1'],
-                        f2=params['f2'],
-                        spacing=params['spacing'],
-                        angle1_deg=params['angle1'],
-                        angle2_deg=params['angle2']
-                    )
-                
-                # Propagate to target z
-                temp_tool.propagate_to(z_pos)
-                field = to_cpu(temp_tool.current_field)
-                
-                # Calculate intensity and phase
-                intensity = np.abs(field)**2
-                intensity_norm = intensity / np.max(intensity)
-                phase = np.angle(field)
-                
-                x = temp_tool.x
-                y = temp_tool.y
-                
-                # Calculate beam width and crop to 8×FWHM (for 45° astigmatic beams)
-                wx, wy = compute_beam_width(intensity, x, y)
-                fwhm_x = 1.177 * wx
-                fwhm_y = 1.177 * wy
+                # Crop to 12×FWHM for better visibility
+                fwhm_x = 1.177 * wx if wx > 0 else L/10
+                fwhm_y = 1.177 * wy if wy > 0 else L/10
                 crop_x = 12 * fwhm_x
                 crop_y = 12 * fwhm_y
                 
                 # Find indices for cropping
                 x_mask = np.abs(x) <= crop_x / 2
                 y_mask = np.abs(y) <= crop_y / 2
+                
+                # Ensure we have some pixels
+                if np.sum(x_mask) < 10 or np.sum(y_mask) < 10:
+                    x_mask = np.abs(x) <= L / 4
+                    y_mask = np.abs(y) <= L / 4
                 
                 # Crop arrays
                 x_crop = x[x_mask]
@@ -2386,9 +2455,8 @@ class BeamPropagationGUI(QMainWindow):
                 
                 if display_type == "Both":
                     # Show both intensity and phase side by side
-                    # This requires double the subplots
-                    ax_int = self.gallery_canvas.fig.add_subplot(nrows, ncols*2, idx*2 + 1)
-                    ax_phase = self.gallery_canvas.fig.add_subplot(nrows, ncols*2, idx*2 + 2)
+                    ax_int = self.gallery_canvas.fig.add_subplot(nrows, ncols*2, plot_idx*2 + 1)
+                    ax_phase = self.gallery_canvas.fig.add_subplot(nrows, ncols*2, plot_idx*2 + 2)
                     
                     # Intensity
                     ax_int.imshow(intensity_crop, extent=extent_crop, origin='lower', 
@@ -2403,7 +2471,7 @@ class BeamPropagationGUI(QMainWindow):
                     ax_phase.axis('off')
                     
                 elif display_type == "Intensity":
-                    ax = self.gallery_canvas.fig.add_subplot(nrows, ncols, idx + 1)
+                    ax = self.gallery_canvas.fig.add_subplot(nrows, ncols, plot_idx + 1)
                     ax.imshow(intensity_crop, extent=extent_crop, origin='lower',
                              cmap='nipy_spectral', aspect='equal', vmin=0.001, vmax=1)
                     
@@ -2414,16 +2482,18 @@ class BeamPropagationGUI(QMainWindow):
                     ax.tick_params(labelsize=6)
                     
                 else:  # Phase
-                    ax = self.gallery_canvas.fig.add_subplot(nrows, ncols, idx + 1)
-                    im = ax.imshow(phase_crop, extent=extent_crop, origin='lower',
-                                  cmap='twilight', aspect='equal', vmin=-np.pi, vmax=np.pi)
+                    ax = self.gallery_canvas.fig.add_subplot(nrows, ncols, plot_idx + 1)
+                    ax.imshow(phase_crop, extent=extent_crop, origin='lower',
+                              cmap='twilight', aspect='equal', vmin=-np.pi, vmax=np.pi)
                     ax.set_title(f'z={z_pos*1e3:.0f}mm\nPhase', fontsize=8)
                     ax.set_xlabel('x (mm)', fontsize=7)
                     ax.set_ylabel('y (mm)', fontsize=7)
                     ax.tick_params(labelsize=6)
             
             # Add main title
-            title_text = f'Beam Evolution: {n_images} positions from z={z_array[0]*1e3:.0f}mm to z={z_array[-1]*1e3:.0f}mm'
+            z_start = self.gallery_images_cache[0]['z_pos'] if 0 in self.gallery_images_cache else 0
+            z_end = self.gallery_images_cache[n_cached-1]['z_pos'] if (n_cached-1) in self.gallery_images_cache else 0
+            title_text = f'Beam Evolution: {n_images} positions from z={z_start*1e3:.0f}mm to z={z_end*1e3:.0f}mm'
             self.gallery_canvas.fig.suptitle(title_text, fontsize=12, weight='bold')
             
             self.gallery_canvas.fig.tight_layout(rect=[0, 0, 1, 0.97])
