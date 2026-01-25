@@ -264,6 +264,82 @@ def compute_beam_width(intensity, x, y):
     
     return wx, wy
 
+
+def compute_beam_width_principal(intensity, x, y):
+    """
+    Compute beam width along principal axes using ISO 11146 second moments.
+    This gives the major and minor axis widths regardless of beam orientation.
+    
+    Parameters:
+    -----------
+    intensity : ndarray
+        Intensity distribution (can be CuPy or NumPy array)
+    x, y : ndarray
+        Coordinate arrays (NumPy arrays)
+    
+    Returns:
+    --------
+    w_major, w_minor : float
+        Beam widths (4-sigma) along major and minor principal axes
+    angle : float
+        Orientation angle of major axis from x-axis (degrees)
+    wx, wy : float
+        Beam widths along x and y axes (for reference)
+    """
+    # Ensure intensity is on CPU for this calculation
+    intensity_cpu = to_cpu(intensity)
+    
+    total = np.sum(intensity_cpu)
+    if total < 1e-20:
+        return np.nan, np.nan, 0.0, np.nan, np.nan
+    
+    # x and y should already be NumPy arrays
+    X, Y = np.meshgrid(x, y)
+    
+    # Centroids
+    x_mean = np.sum(X * intensity_cpu) / total
+    y_mean = np.sum(Y * intensity_cpu) / total
+    
+    # Second moments (variance matrix elements)
+    sigma_xx = np.sum((X - x_mean)**2 * intensity_cpu) / total
+    sigma_yy = np.sum((Y - y_mean)**2 * intensity_cpu) / total
+    sigma_xy = np.sum((X - x_mean) * (Y - y_mean) * intensity_cpu) / total
+    
+    # X and Y widths
+    wx = 4 * np.sqrt(sigma_xx)
+    wy = 4 * np.sqrt(sigma_yy)
+    
+    # Principal axis calculation using eigenvalue decomposition
+    # The covariance matrix is [[sigma_xx, sigma_xy], [sigma_xy, sigma_yy]]
+    # Eigenvalues give the variances along principal axes
+    
+    # Trace and determinant
+    trace = sigma_xx + sigma_yy
+    det = sigma_xx * sigma_yy - sigma_xy**2
+    
+    # Eigenvalues (variances along principal axes)
+    discriminant = np.sqrt(max(0, (trace/2)**2 - det))
+    lambda1 = trace/2 + discriminant  # Larger eigenvalue (major axis)
+    lambda2 = trace/2 - discriminant  # Smaller eigenvalue (minor axis)
+    
+    # Ensure non-negative
+    lambda1 = max(0, lambda1)
+    lambda2 = max(0, lambda2)
+    
+    # 4-sigma widths along principal axes
+    w_major = 4 * np.sqrt(lambda1)
+    w_minor = 4 * np.sqrt(lambda2)
+    
+    # Orientation angle of major axis
+    if abs(sigma_xy) < 1e-20 and abs(sigma_xx - sigma_yy) < 1e-20:
+        angle = 0.0  # Circular beam
+    else:
+        # Angle of major axis from x-axis
+        angle = 0.5 * np.arctan2(2 * sigma_xy, sigma_xx - sigma_yy)
+        angle = np.degrees(angle)
+    
+    return w_major, w_minor, angle, wx, wy
+
 # ============================================================================
 # MAIN BEAM PROPAGATION CLASS
 # ============================================================================
@@ -506,6 +582,9 @@ class BeamPropagationTool:
         z_array = np.linspace(z_start, z_end, n_points)
         wx_array = []
         wy_array = []
+        w_major_array = []
+        w_minor_array = []
+        angle_array = []
         
         print(f"\nMeasuring beam widths...")
         for i, z in enumerate(z_array):
@@ -516,15 +595,24 @@ class BeamPropagationTool:
             )
             
             intensity = np.abs(field_z)**2
-            wx, wy = compute_beam_width(intensity, self.x, self.y)
+            
+            # Get both X/Y and principal axis widths
+            w_major, w_minor, angle, wx, wy = compute_beam_width_principal(intensity, self.x, self.y)
+            
             wx_array.append(wx)
             wy_array.append(wy)
+            w_major_array.append(w_major)
+            w_minor_array.append(w_minor)
+            angle_array.append(angle)
             
             if (i + 1) % 5 == 0 or i == 0 or i == n_points - 1:
-                print(f"  z={z*1e3:.1f}mm: wx={wx*1e6:.1f}µm, wy={wy*1e6:.1f}µm")
+                print(f"  z={z*1e3:.1f}mm: wx={wx*1e6:.1f}µm, wy={wy*1e6:.1f}µm | major={w_major*1e6:.1f}µm, minor={w_minor*1e6:.1f}µm, θ={angle:.1f}°")
         
         wx_array = np.array(wx_array)
         wy_array = np.array(wy_array)
+        w_major_array = np.array(w_major_array)
+        w_minor_array = np.array(w_minor_array)
+        angle_array = np.array(angle_array)
         
         # Find focus locations (minimum beam width)
         idx_focus_x = np.argmin(wx_array)
@@ -663,6 +751,20 @@ class BeamPropagationTool:
         w0_fit_y, z0_fit_y, M2_y = fit_m2_1d(z_array, wy_array, z_focus_y, w0_y, 'Y')
         zR_y = np.pi * w0_fit_y**2 / (M2_y * self.wavelength)
         
+        # Fit Major axis
+        idx_focus_major = np.argmin(w_major_array)
+        z_focus_major = z_array[idx_focus_major]
+        w0_major_guess = w_major_array[idx_focus_major]
+        w0_fit_major, z0_fit_major, M2_major = fit_m2_1d(z_array, w_major_array, z_focus_major, w0_major_guess, 'Major')
+        zR_major = np.pi * w0_fit_major**2 / (M2_major * self.wavelength)
+        
+        # Fit Minor axis
+        idx_focus_minor = np.argmin(w_minor_array)
+        z_focus_minor = z_array[idx_focus_minor]
+        w0_minor_guess = w_minor_array[idx_focus_minor]
+        w0_fit_minor, z0_fit_minor, M2_minor = fit_m2_1d(z_array, w_minor_array, z_focus_minor, w0_minor_guess, 'Minor')
+        zR_minor = np.pi * w0_fit_minor**2 / (M2_minor * self.wavelength)
+        
         # Calculate astigmatism components
         # Focus separation (total astigmatism)
         delta_z = z0_fit_x - z0_fit_y  # Signed difference
@@ -728,6 +830,11 @@ class BeamPropagationTool:
         print(f"  Ellipticity at X focus: {ellipticity_at_x_focus:.3f}")
         print(f"  Ellipticity at Y focus: {ellipticity_at_y_focus:.3f}")
         
+        print(f"\nPRINCIPAL AXIS RESULTS (Major/Minor):")
+        print(f"  Major axis: w0={w0_fit_major*1e6:.2f}µm, z0={z0_fit_major*1e3:.2f}mm, M²={M2_major:.3f}")
+        print(f"  Minor axis: w0={w0_fit_minor*1e6:.2f}µm, z0={z0_fit_minor*1e3:.2f}mm, M²={M2_minor:.3f}")
+        print(f"  Mean orientation angle: {np.mean(angle_array):.1f}°")
+        
         if astigmatism_total < 1e-3:  # Less than 1mm
             print(f"\n  ✓ Excellent! Well corrected astigmatism.")
         elif astigmatism_total < 5e-3:
@@ -744,8 +851,9 @@ class BeamPropagationTool:
         
         print(f"{'='*70}")
         
-        # Store M² data with astigmatism analysis
+        # Store M² data with astigmatism analysis and principal axis data
         m2_data = {
+            # X/Y axis data
             'z_array': z_array,
             'wx_array': wx_array,
             'wy_array': wy_array,
@@ -757,6 +865,19 @@ class BeamPropagationTool:
             'zR_y': zR_y,
             'M2_x': M2_x,
             'M2_y': M2_y,
+            # Principal axis (Major/Minor) data
+            'w_major_array': w_major_array,
+            'w_minor_array': w_minor_array,
+            'angle_array': angle_array,
+            'z_focus_major': z0_fit_major,
+            'z_focus_minor': z0_fit_minor,
+            'w0_major': w0_fit_major,
+            'w0_minor': w0_fit_minor,
+            'zR_major': zR_major,
+            'zR_minor': zR_minor,
+            'M2_major': M2_major,
+            'M2_minor': M2_minor,
+            # Setup parameters
             'z_m2_lens': z_m2_lens,
             'f_m2': f_m2,
             'z_gap': z_gap,
