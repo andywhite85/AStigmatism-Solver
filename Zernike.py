@@ -8,6 +8,8 @@ This tool allows you to:
 3. Propagate the beam using Angular Spectrum method
 4. Visualize intensity and wavefront at multiple positions
 
+Supports GPU acceleration via CuPy (optional)
+
 Author: Created for Andy's optical simulations
 Date: January 2026
 """
@@ -16,6 +18,70 @@ import numpy as np
 import matplotlib.pyplot as plt
 import math
 from scipy.optimize import curve_fit
+
+# ============================================================================
+# GPU SUPPORT - TRY TO IMPORT CUPY
+# ============================================================================
+
+GPU_AVAILABLE = False
+cp = None
+
+try:
+    import cupy as cp
+    # Test if GPU is actually accessible
+    cp.cuda.Device(0).compute_capability
+    GPU_AVAILABLE = True
+    print("✓ CuPy detected - GPU acceleration available")
+except ImportError:
+    print("○ CuPy not installed - using CPU (NumPy)")
+except Exception as e:
+    print(f"○ CuPy installed but GPU not accessible: {e}")
+    print("  Using CPU (NumPy)")
+
+# Global flag to control GPU usage (can be toggled)
+USE_GPU = GPU_AVAILABLE
+
+
+def set_gpu_enabled(enabled):
+    """Enable or disable GPU acceleration"""
+    global USE_GPU
+    if enabled and not GPU_AVAILABLE:
+        print("Warning: GPU not available, staying on CPU")
+        USE_GPU = False
+    else:
+        USE_GPU = enabled
+        if USE_GPU:
+            print("GPU acceleration: ENABLED")
+        else:
+            print("GPU acceleration: DISABLED (using CPU)")
+
+
+def get_array_module():
+    """Get the appropriate array module (cupy or numpy)"""
+    if USE_GPU and GPU_AVAILABLE:
+        return cp
+    return np
+
+
+def to_gpu(array):
+    """Transfer array to GPU if GPU is enabled"""
+    if USE_GPU and GPU_AVAILABLE:
+        return cp.asarray(array)
+    return array
+
+
+def to_cpu(array):
+    """Transfer array to CPU (numpy)"""
+    # Check if it's a CuPy array by checking for .get() method
+    # This works regardless of the USE_GPU flag state
+    if hasattr(array, 'get'):
+        return array.get()
+    # Check if it's already a numpy array
+    if isinstance(array, np.ndarray):
+        return array
+    # Otherwise try to convert
+    return np.asarray(array)
+
 
 # ============================================================================
 # ZERNIKE POLYNOMIAL FUNCTIONS
@@ -103,7 +169,7 @@ def build_wavefront_from_zernike(coefficients, rho, theta, wavelength):
 # BEAM PROPAGATION FUNCTIONS
 # ============================================================================
 
-def propagate_angular_spectrum(field, wavelength, dx, dz):
+def propagate_angular_spectrum(field, wavelength, dx, dz, use_gpu=None):
     """
     Propagate complex field using Angular Spectrum method
     
@@ -117,27 +183,44 @@ def propagate_angular_spectrum(field, wavelength, dx, dz):
         Spatial sampling in meters
     dz : float
         Propagation distance in meters (can be negative)
+    use_gpu : bool or None
+        If None, uses global USE_GPU setting. If True/False, overrides.
     
     Returns:
     --------
     field_prop : ndarray (complex)
-        Propagated complex field
+        Propagated complex field (on same device as input, or CPU if use_gpu=False)
     """
+    # Determine whether to use GPU
+    if use_gpu is None:
+        use_gpu = USE_GPU and GPU_AVAILABLE
+    
+    if use_gpu and GPU_AVAILABLE:
+        xp = cp
+        # Transfer to GPU if needed
+        if not hasattr(field, 'device'):
+            field = cp.asarray(field)
+    else:
+        xp = np
+        # Ensure on CPU
+        if hasattr(field, 'get'):
+            field = field.get()
+    
     N = field.shape[0]
-    k = 2 * np.pi / wavelength
+    k = 2 * xp.pi / wavelength
     
     # Frequency coordinates
-    fx = np.fft.fftfreq(N, dx)
-    fy = np.fft.fftfreq(N, dx)
-    FX, FY = np.meshgrid(fx, fy)
+    fx = xp.fft.fftfreq(N, dx)
+    fy = xp.fft.fftfreq(N, dx)
+    FX, FY = xp.meshgrid(fx, fy)
     
     # Transfer function
-    kz = np.sqrt(k**2 - (2*np.pi*FX)**2 - (2*np.pi*FY)**2 + 0j)
-    H = np.exp(1j * kz * dz)
+    kz = xp.sqrt(k**2 - (2*xp.pi*FX)**2 - (2*xp.pi*FY)**2 + 0j)
+    H = xp.exp(1j * kz * dz)
     
     # Propagate
-    field_fft = np.fft.fft2(field)
-    field_prop = np.fft.ifft2(field_fft * H)
+    field_fft = xp.fft.fft2(field)
+    field_prop = xp.fft.ifft2(field_fft * H)
     
     return field_prop
 
@@ -148,28 +231,32 @@ def compute_beam_width(intensity, x, y):
     Parameters:
     -----------
     intensity : ndarray
-        Intensity distribution
+        Intensity distribution (can be CuPy or NumPy array)
     x, y : ndarray
-        Coordinate arrays
+        Coordinate arrays (NumPy arrays)
     
     Returns:
     --------
     wx, wy : float
         Beam widths (4-sigma) in x and y
     """
-    total = np.sum(intensity)
+    # Ensure intensity is on CPU for this calculation
+    intensity_cpu = to_cpu(intensity)
+    
+    total = np.sum(intensity_cpu)
     if total < 1e-20:
         return np.nan, np.nan
     
+    # x and y should already be NumPy arrays
     X, Y = np.meshgrid(x, y)
     
     # Centroids
-    x_mean = np.sum(X * intensity) / total
-    y_mean = np.sum(Y * intensity) / total
+    x_mean = np.sum(X * intensity_cpu) / total
+    y_mean = np.sum(Y * intensity_cpu) / total
     
     # Second moments
-    x2 = np.sum((X - x_mean)**2 * intensity) / total
-    y2 = np.sum((Y - y_mean)**2 * intensity) / total
+    x2 = np.sum((X - x_mean)**2 * intensity_cpu) / total
+    y2 = np.sum((Y - y_mean)**2 * intensity_cpu) / total
     
     # 4-sigma widths
     wx = 4 * np.sqrt(x2)
@@ -184,9 +271,10 @@ def compute_beam_width(intensity, x, y):
 class BeamPropagationTool:
     """
     Comprehensive beam propagation tool with Zernike wavefront builder
+    Supports GPU acceleration via CuPy (optional)
     """
     
-    def __init__(self, w0, wavelength, grid_size=512, physical_size=10e-3):
+    def __init__(self, w0, wavelength, grid_size=512, physical_size=10e-3, use_gpu=None, verbose=True):
         """
         Initialize the beam propagation tool
         
@@ -200,18 +288,31 @@ class BeamPropagationTool:
             Number of grid points (default 512)
         physical_size : float
             Physical size of computational window (meters)
+        use_gpu : bool or None
+            If True, use GPU acceleration (requires CuPy)
+            If False, use CPU only
+            If None, auto-detect (use GPU if available)
+        verbose : bool
+            If True, print initialization info (default True)
         """
         self.w0 = w0
         self.wavelength = wavelength
         self.k = 2 * np.pi / wavelength
         self.zR = np.pi * w0**2 / wavelength  # Rayleigh range
+        self.verbose = verbose
+        
+        # GPU settings
+        if use_gpu is None:
+            self.use_gpu = USE_GPU and GPU_AVAILABLE
+        else:
+            self.use_gpu = use_gpu and GPU_AVAILABLE
         
         # Grid setup
         self.N = grid_size
         self.L = physical_size
         self.dx = self.L / self.N
         
-        # Coordinate arrays
+        # Coordinate arrays (always on CPU for compatibility)
         self.x = np.linspace(-self.L/2, self.L/2, self.N)
         self.y = np.linspace(-self.L/2, self.L/2, self.N)
         self.X, self.Y = np.meshgrid(self.x, self.y)
@@ -229,16 +330,33 @@ class BeamPropagationTool:
         # Zernike coefficients
         self.zernike_coeffs = {}
         
-        print("="*70)
-        print("BEAM PROPAGATION TOOL INITIALIZED")
-        print("="*70)
-        print(f"Wavelength: {self.wavelength*1e9:.1f} nm")
-        print(f"Initial waist (w0): {self.w0*1e6:.1f} µm")
-        print(f"Rayleigh range (zR): {self.zR*1e3:.1f} mm")
-        print(f"Grid size: {self.N} x {self.N}")
-        print(f"Physical window: {self.L*1e3:.1f} mm x {self.L*1e3:.1f} mm")
-        print(f"Spatial resolution: {self.dx*1e6:.2f} µm")
-        print("="*70)
+        if self.verbose:
+            print("="*70)
+            print("BEAM PROPAGATION TOOL INITIALIZED")
+            print("="*70)
+            print(f"Wavelength: {self.wavelength*1e9:.1f} nm")
+            print(f"Initial waist (w0): {self.w0*1e6:.1f} µm")
+            print(f"Rayleigh range (zR): {self.zR*1e3:.1f} mm")
+            print(f"Grid size: {self.N} x {self.N}")
+            print(f"Physical window: {self.L*1e3:.1f} mm x {self.L*1e3:.1f} mm")
+            print(f"Spatial resolution: {self.dx*1e6:.2f} µm")
+            if self.use_gpu:
+                print(f"GPU acceleration: ENABLED (CuPy)")
+            else:
+                print(f"GPU acceleration: DISABLED (NumPy)")
+            print("="*70)
+    
+    def set_gpu(self, enabled):
+        """Enable or disable GPU acceleration for this tool instance"""
+        if enabled and not GPU_AVAILABLE:
+            print("Warning: GPU not available, staying on CPU")
+            self.use_gpu = False
+        else:
+            self.use_gpu = enabled
+            if self.use_gpu:
+                print("GPU acceleration: ENABLED")
+            else:
+                print("GPU acceleration: DISABLED")
     
     def add_zernike_aberration(self, n, m, coefficient_nm):
         """
@@ -419,32 +537,168 @@ class BeamPropagationTool:
         
         # Fit M² in X direction
         # w(z)² = w0² + (M²λ/πw0)²(z-z0)²
-        def fit_m2_1d(z_data, w_data, z0_guess, w0_guess):
-            from scipy.optimize import curve_fit
+        def fit_m2_1d(z_data, w_data, z0_guess, w0_guess, direction=''):
+            from scipy.optimize import curve_fit, minimize
             
-            def hyperbola(z, w0, z0, M2):
+            # Calculate data range for better bounds
+            z_span = z_data[-1] - z_data[0]
+            w_min = np.min(w_data)
+            w_max = np.max(w_data)
+            z_at_min = z_data[np.argmin(w_data)]
+            
+            # Method 1: Fit w² vs z² (more linear, better conditioned)
+            # w² = w0² + (M²λ/πw0)² * (z-z0)²
+            # Let A = w0², B = (M²λ/πw0)², then w² = A + B*(z-z0)²
+            
+            def fit_w_squared(z, w0, z0, M2):
                 theta = M2 * self.wavelength / (np.pi * w0)
                 return np.sqrt(w0**2 + (theta * (z - z0))**2)
             
+            # Also try fitting w² directly (often more stable)
+            def fit_w2_linear(z, A, B, z0):
+                # w² = A + B*(z-z0)²
+                return A + B * (z - z0)**2
+            
+            w2_data = w_data**2
+            
+            best_result = None
+            best_r2 = -np.inf
+            
+            # Try multiple approaches
+            approaches = []
+            
+            # Approach 1: Direct hyperbola fit with different initial guesses
+            for m2_init in [1.0, 1.5, 2.0, 3.0, 5.0]:
+                for w0_init in [w_min * 0.95, w_min, w_min * 1.05]:
+                    approaches.append(('hyperbola', w0_init, z_at_min, m2_init))
+            
+            # Approach 2: Linear fit to w² first, then extract parameters
             try:
-                popt, _ = curve_fit(
-                    hyperbola, z_data, w_data,
-                    p0=[w0_guess, z0_guess, 1.0],
-                    bounds=([w0_guess*0.5, z0_guess-5*zR_estimate, 0.5],
-                           [w0_guess*2.0, z0_guess+5*zR_estimate, 10.0])
+                # Initial guess for linear fit: A = w_min², B from slope
+                A_init = w_min**2
+                # Estimate B from the data spread
+                B_init = (w_max**2 - w_min**2) / ((z_data[-1] - z_at_min)**2 + 1e-20)
+                
+                popt_linear, _ = curve_fit(
+                    fit_w2_linear, z_data, w2_data,
+                    p0=[A_init, B_init, z_at_min],
+                    bounds=([0, 0, z_data[0] - z_span], 
+                           [w_max**2 * 4, np.inf, z_data[-1] + z_span]),
+                    maxfev=10000
                 )
-                return popt  # w0, z0, M2
+                
+                A_fit, B_fit, z0_fit = popt_linear
+                w0_from_linear = np.sqrt(A_fit)
+                # B = (M²λ/πw0)² => M² = πw0/λ * sqrt(B)
+                theta_fit = np.sqrt(B_fit)
+                M2_from_linear = theta_fit * np.pi * w0_from_linear / self.wavelength
+                
+                if M2_from_linear > 0.5 and M2_from_linear < 100:
+                    approaches.append(('from_linear', w0_from_linear, z0_fit, M2_from_linear))
             except:
-                # If fit fails, return estimates
-                return w0_guess, z0_guess, 1.0
+                pass
+            
+            # Try all approaches
+            for approach in approaches:
+                try:
+                    method, w0_init, z0_init, m2_init = approach
+                    
+                    # Bounds
+                    w0_lower = w_min * 0.5
+                    w0_upper = w_min * 2.0
+                    z0_lower = z_data[0] - z_span
+                    z0_upper = z_data[-1] + z_span
+                    M2_lower = 0.5
+                    M2_upper = 100.0
+                    
+                    popt, _ = curve_fit(
+                        fit_w_squared, z_data, w_data,
+                        p0=[w0_init, z0_init, m2_init],
+                        bounds=([w0_lower, z0_lower, M2_lower],
+                               [w0_upper, z0_upper, M2_upper]),
+                        maxfev=10000,
+                        ftol=1e-12,
+                        xtol=1e-12
+                    )
+                    
+                    # Calculate R²
+                    w_fit = fit_w_squared(z_data, *popt)
+                    residuals = w_data - w_fit
+                    ss_res = np.sum(residuals**2)
+                    ss_tot = np.sum((w_data - np.mean(w_data))**2)
+                    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+                    
+                    if r_squared > best_r2:
+                        best_r2 = r_squared
+                        best_result = popt
+                        
+                except Exception as e:
+                    continue
+            
+            if best_result is not None:
+                popt = best_result
+                r_squared = best_r2
+                print(f"  {direction} fit: w0={popt[0]*1e6:.2f}µm, z0={popt[1]*1e3:.3f}mm, M²={popt[2]:.4f}, R²={r_squared:.4f}")
+                return popt  # w0, z0, M2
+            else:
+                # Fallback: estimate from data
+                print(f"  Warning: {direction} fit failed, using estimates")
+                
+                # Estimate M² from beam divergence
+                # At edges, w ≈ theta * |z - z0| for large |z-z0|
+                # theta = M² * lambda / (pi * w0)
+                w_edge = (w_data[0] + w_data[-1]) / 2
+                z_edge = (abs(z_data[0] - z_at_min) + abs(z_data[-1] - z_at_min)) / 2
+                theta_est = np.sqrt(w_edge**2 - w_min**2) / z_edge if z_edge > 0 else 0.01
+                M2_est = theta_est * np.pi * w_min / self.wavelength
+                M2_est = max(1.0, min(50.0, M2_est))
+                
+                return w_min, z_at_min, M2_est
         
         # Fit X direction
-        w0_fit_x, z0_fit_x, M2_x = fit_m2_1d(z_array, wx_array, z_focus_x, w0_x)
-        zR_x = np.pi * w0_fit_x**2 / self.wavelength
+        w0_fit_x, z0_fit_x, M2_x = fit_m2_1d(z_array, wx_array, z_focus_x, w0_x, 'X')
+        zR_x = np.pi * w0_fit_x**2 / (M2_x * self.wavelength)
         
         # Fit Y direction
-        w0_fit_y, z0_fit_y, M2_y = fit_m2_1d(z_array, wy_array, z_focus_y, w0_y)
-        zR_y = np.pi * w0_fit_y**2 / self.wavelength
+        w0_fit_y, z0_fit_y, M2_y = fit_m2_1d(z_array, wy_array, z_focus_y, w0_y, 'Y')
+        zR_y = np.pi * w0_fit_y**2 / (M2_y * self.wavelength)
+        
+        # Calculate astigmatism components
+        # Focus separation (total astigmatism)
+        delta_z = z0_fit_x - z0_fit_y  # Signed difference
+        astigmatism_total = abs(delta_z)
+        
+        # Beam asymmetry at focus (ratio of waists)
+        asymmetry_ratio = max(w0_fit_x, w0_fit_y) / min(w0_fit_x, w0_fit_y) if min(w0_fit_x, w0_fit_y) > 0 else 1.0
+        
+        # For 0° and 45° astigmatism decomposition:
+        # 0° astigmatism (Z2,2): difference between X and Y focus
+        # 45° astigmatism (Z2,-2): would show as rotation of the ellipse axes
+        # 
+        # Since we measure along X and Y axes, the measured astigmatism is primarily 0°
+        # To detect 45° astigmatism, we'd need to measure at intermediate angles
+        # However, we can estimate from the beam shape evolution
+        
+        # Astigmatism in diopters (optical power difference)
+        # Δφ = 1/fx - 1/fy where f is the effective focal length to each focus
+        if astigmatism_total > 1e-6:
+            # Estimate astigmatism in waves at the beam
+            # Zernike Z(2,2) coefficient ≈ delta_z * NA² / 4 (approximation)
+            NA_estimate = self.wavelength / (np.pi * min(w0_fit_x, w0_fit_y))
+            astig_waves = astigmatism_total * NA_estimate**2 / (4 * self.wavelength)
+        else:
+            astig_waves = 0
+        
+        # 0° vs 45° determination based on principal axes alignment
+        # If X and Y are the principal axes, astigmatism is primarily 0°
+        # The ratio of focus positions indicates the orientation
+        astig_0_deg = astigmatism_total  # Measured directly along X/Y
+        astig_45_deg = 0.0  # Would require rotated measurement to detect
+        
+        # Calculate asymmetry metrics
+        # Ellipticity at each focus
+        ellipticity_at_x_focus = wy_array[np.argmin(np.abs(z_array - z0_fit_x))] / w0_fit_x if w0_fit_x > 0 else 1.0
+        ellipticity_at_y_focus = wx_array[np.argmin(np.abs(z_array - z0_fit_y))] / w0_fit_y if w0_fit_y > 0 else 1.0
         
         print(f"\n{'='*70}")
         print("M² MEASUREMENT RESULTS:")
@@ -461,19 +715,36 @@ class BeamPropagationTool:
         print(f"  Rayleigh range (zRy): {zR_y*1e3:.2f}mm")
         print(f"  M²y: {M2_y:.3f}")
         
-        astigmatism = abs(z0_fit_x - z0_fit_y)
-        print(f"\nAstigmatism (focus separation): {astigmatism*1e3:.2f}mm")
+        print(f"\n{'-'*70}")
+        print("ASTIGMATISM ANALYSIS:")
+        print(f"{'-'*70}")
+        print(f"\nFocus separation (total): {astigmatism_total*1e3:.3f} mm")
+        print(f"  0° astigmatism (X-Y): {astig_0_deg*1e3:.3f} mm")
+        print(f"  45° astigmatism: {astig_45_deg*1e3:.3f} mm (requires rotated measurement)")
+        print(f"  Astigmatism: ~{astig_waves:.2f} waves")
         
-        if astigmatism < 1e-3:  # Less than 1mm
-            print(f"  ✓ Excellent! Well corrected.")
-        elif astigmatism < 5e-3:
-            print(f"  ○ Good correction, slight residual astigmatism.")
+        print(f"\nASYMMETRY ANALYSIS:")
+        print(f"  Waist ratio (w0_max/w0_min): {asymmetry_ratio:.3f}")
+        print(f"  Ellipticity at X focus: {ellipticity_at_x_focus:.3f}")
+        print(f"  Ellipticity at Y focus: {ellipticity_at_y_focus:.3f}")
+        
+        if astigmatism_total < 1e-3:  # Less than 1mm
+            print(f"\n  ✓ Excellent! Well corrected astigmatism.")
+        elif astigmatism_total < 5e-3:
+            print(f"\n  ○ Good correction, slight residual astigmatism.")
         else:
-            print(f"  ✗ Significant astigmatism remains.")
+            print(f"\n  ✗ Significant astigmatism remains.")
+        
+        if asymmetry_ratio < 1.1:
+            print(f"  ✓ Beam is nearly circular (asymmetry < 10%)")
+        elif asymmetry_ratio < 1.3:
+            print(f"  ○ Moderate beam ellipticity ({(asymmetry_ratio-1)*100:.0f}%)")
+        else:
+            print(f"  ✗ Significant beam ellipticity ({(asymmetry_ratio-1)*100:.0f}%)")
         
         print(f"{'='*70}")
         
-        # Store M² data
+        # Store M² data with astigmatism analysis
         m2_data = {
             'z_array': z_array,
             'wx_array': wx_array,
@@ -490,11 +761,136 @@ class BeamPropagationTool:
             'f_m2': f_m2,
             'z_gap': z_gap,
             'z_range': z_range_used,
-            'n_points': n_points
+            'n_points': n_points,
+            'field_at_m2_lens': field_at_m2_lens,
+            # Astigmatism analysis
+            'astigmatism_total': astigmatism_total,
+            'astig_0_deg': astig_0_deg,
+            'astig_45_deg': astig_45_deg,
+            'astig_waves': astig_waves,
+            'asymmetry_ratio': asymmetry_ratio,
+            'ellipticity_at_x_focus': ellipticity_at_x_focus,
+            'ellipticity_at_y_focus': ellipticity_at_y_focus,
         }
         
         self.m2_data = m2_data
+        self.field_at_m2_lens = field_at_m2_lens  # Also store directly on tool
+        
+        # Auto-save debug data
+        self.save_m2_debug_data()
+        
         return m2_data
+    
+    def save_m2_debug_data(self, filename='m2_debug_data.txt'):
+        """
+        Save M² measurement raw data and fit results to a text file for debugging.
+        
+        Parameters:
+        -----------
+        filename : str
+            Output filename (default: m2_debug_data.txt)
+        """
+        if not hasattr(self, 'm2_data'):
+            print("Error: No M² data available.")
+            return
+        
+        m2 = self.m2_data
+        
+        # Calculate fit curves
+        z_fit = np.linspace(m2['z_array'][0], m2['z_array'][-1], 100)
+        
+        def hyperbola(z, w0, z0, M2):
+            theta = M2 * self.wavelength / (np.pi * w0)
+            return np.sqrt(w0**2 + (theta * (z - z0))**2)
+        
+        wx_fit = hyperbola(z_fit, m2['w0_x'], m2['z_focus_x'], m2['M2_x'])
+        wy_fit = hyperbola(z_fit, m2['w0_y'], m2['z_focus_y'], m2['M2_y'])
+        
+        # Calculate fit at measurement points for residuals
+        wx_fit_at_data = hyperbola(m2['z_array'], m2['w0_x'], m2['z_focus_x'], m2['M2_x'])
+        wy_fit_at_data = hyperbola(m2['z_array'], m2['w0_y'], m2['z_focus_y'], m2['M2_y'])
+        
+        # Calculate R² values
+        wx_residuals = m2['wx_array'] - wx_fit_at_data
+        wy_residuals = m2['wy_array'] - wy_fit_at_data
+        
+        ss_res_x = np.sum(wx_residuals**2)
+        ss_tot_x = np.sum((m2['wx_array'] - np.mean(m2['wx_array']))**2)
+        r2_x = 1 - (ss_res_x / ss_tot_x) if ss_tot_x > 0 else 0
+        
+        ss_res_y = np.sum(wy_residuals**2)
+        ss_tot_y = np.sum((m2['wy_array'] - np.mean(m2['wy_array']))**2)
+        r2_y = 1 - (ss_res_y / ss_tot_y) if ss_tot_y > 0 else 0
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write("M² MEASUREMENT DEBUG DATA\n")
+            f.write("=" * 80 + "\n\n")
+            
+            # Setup parameters
+            f.write("SETUP PARAMETERS:\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"Wavelength: {self.wavelength*1e9:.1f} nm\n")
+            f.write(f"z_gap: {m2['z_gap']*1e3:.1f} mm\n")
+            f.write(f"f_m2: {m2['f_m2']*1e3:.1f} mm\n")
+            f.write(f"z_range: {m2['z_range']*1e3:.1f} mm\n")
+            f.write(f"n_points: {m2['n_points']}\n")
+            f.write(f"z_m2_lens: {m2['z_m2_lens']*1e3:.1f} mm\n\n")
+            
+            # Fit results
+            f.write("FIT RESULTS:\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"X direction:\n")
+            f.write(f"  M²_x = {m2['M2_x']:.4f}\n")
+            f.write(f"  w0_x = {m2['w0_x']*1e6:.2f} µm\n")
+            f.write(f"  z_focus_x = {m2['z_focus_x']*1e3:.3f} mm\n")
+            f.write(f"  zR_x = {m2['zR_x']*1e3:.3f} mm\n")
+            f.write(f"  R² = {r2_x:.4f}\n\n")
+            
+            f.write(f"Y direction:\n")
+            f.write(f"  M²_y = {m2['M2_y']:.4f}\n")
+            f.write(f"  w0_y = {m2['w0_y']*1e6:.2f} µm\n")
+            f.write(f"  z_focus_y = {m2['z_focus_y']*1e3:.3f} mm\n")
+            f.write(f"  zR_y = {m2['zR_y']*1e3:.3f} mm\n")
+            f.write(f"  R² = {r2_y:.4f}\n\n")
+            
+            # Raw measurement data
+            f.write("=" * 80 + "\n")
+            f.write("RAW MEASUREMENT DATA:\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"{'z (mm)':>12} {'wx (µm)':>12} {'wy (µm)':>12} {'wx_fit (µm)':>12} {'wy_fit (µm)':>12} {'wx_res (µm)':>12} {'wy_res (µm)':>12}\n")
+            f.write("-" * 84 + "\n")
+            
+            for i in range(len(m2['z_array'])):
+                z = m2['z_array'][i] * 1e3
+                wx = m2['wx_array'][i] * 1e6
+                wy = m2['wy_array'][i] * 1e6
+                wx_f = wx_fit_at_data[i] * 1e6
+                wy_f = wy_fit_at_data[i] * 1e6
+                wx_r = wx_residuals[i] * 1e6
+                wy_r = wy_residuals[i] * 1e6
+                f.write(f"{z:12.3f} {wx:12.2f} {wy:12.2f} {wx_f:12.2f} {wy_f:12.2f} {wx_r:12.2f} {wy_r:12.2f}\n")
+            
+            f.write("\n")
+            f.write("=" * 80 + "\n")
+            f.write("FIT CURVE DATA (for plotting):\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"{'z_fit (mm)':>12} {'wx_fit (µm)':>12} {'wy_fit (µm)':>12}\n")
+            f.write("-" * 36 + "\n")
+            
+            for i in range(len(z_fit)):
+                f.write(f"{z_fit[i]*1e3:12.3f} {wx_fit[i]*1e6:12.2f} {wy_fit[i]*1e6:12.2f}\n")
+            
+            f.write("\n")
+            f.write("=" * 80 + "\n")
+            f.write("HYPERBOLA FIT EQUATION:\n")
+            f.write("=" * 80 + "\n")
+            f.write("w(z) = sqrt(w0^2 + (theta*(z-z0))^2)\n")
+            f.write("where theta = M^2 * lambda / (pi * w0)\n\n")
+            f.write(f"X: w(z) = sqrt(({m2['w0_x']*1e6:.2f}um)^2 + ({m2['M2_x']:.4f} * {self.wavelength*1e9:.1f}nm / (pi * {m2['w0_x']*1e6:.2f}um) * (z - {m2['z_focus_x']*1e3:.3f}mm))^2)\n")
+            f.write(f"Y: w(z) = sqrt(({m2['w0_y']*1e6:.2f}um)^2 + ({m2['M2_y']:.4f} * {self.wavelength*1e9:.1f}nm / (pi * {m2['w0_y']*1e6:.2f}um) * (z - {m2['z_focus_y']*1e3:.3f}mm))^2)\n")
+            
+        print(f"\nDebug data saved to: {filename}")
     
     def plot_m2_results(self, m2_data=None, filename='m2_measurement.png'):
         """
@@ -726,12 +1122,15 @@ Beam Quality:
         print(f"Propagating from z={self.current_z*1e3:.1f}mm to z={z_target*1e3:.1f}mm (Δz={dz*1e3:.1f}mm)")
         
         self.current_field = propagate_angular_spectrum(
-            self.current_field, self.wavelength, self.dx, dz
+            self.current_field, self.wavelength, self.dx, dz, use_gpu=self.use_gpu
         )
+        
+        # Ensure field is on CPU for beam width calculation
+        field_cpu = to_cpu(self.current_field)
         self.current_z = z_target
         
         # Calculate beam width
-        intensity = np.abs(self.current_field)**2
+        intensity = np.abs(field_cpu)**2
         wx, wy = compute_beam_width(intensity, self.x, self.y)
         print(f"  Beam size at z={z_target*1e3:.1f}mm: wx={wx*1e6:.1f}µm, wy={wy*1e6:.1f}µm")
         
@@ -754,8 +1153,9 @@ Beam Quality:
         # Thin lens phase: φ = -k * r² / (2*f)
         phase_lens = -self.k * self.R**2 / (2 * focal_length)
         
-        # Apply lens
-        self.current_field = self.current_field * np.exp(1j * phase_lens)
+        # Apply lens (ensure compatible arrays)
+        field_cpu = to_cpu(self.current_field)
+        self.current_field = field_cpu * np.exp(1j * phase_lens)
         
         lens_type = "converging" if focal_length > 0 else "diverging"
         print(f"\nApplied {lens_type} lens at z={self.current_z*1e3:.1f}mm:")
@@ -802,8 +1202,9 @@ Beam Quality:
         # Combined phase
         total_phase = phase_lens + phase_aberration
         
-        # Apply to field
-        self.current_field = self.current_field * np.exp(1j * total_phase)
+        # Apply to field (ensure compatible arrays)
+        field_cpu = to_cpu(self.current_field)
+        self.current_field = field_cpu * np.exp(1j * total_phase)
         
         lens_type = "converging" if focal_length > 0 else "diverging"
         print(f"\nApplied aberrated {lens_type} lens at z={self.current_z*1e3:.1f}mm:")
@@ -848,8 +1249,9 @@ Beam Quality:
         # Standard: cylinder axis along X, focuses in Y
         phase_cyl = -self.k * Y_rot**2 / (2 * focal_length)
         
-        # Apply lens
-        self.current_field = self.current_field * np.exp(1j * phase_cyl)
+        # Apply lens (ensure compatible arrays)
+        field_cpu = to_cpu(self.current_field)
+        self.current_field = field_cpu * np.exp(1j * phase_cyl)
         
         lens_type = "converging" if focal_length > 0 else "diverging"
         print(f"\nApplied {lens_type} cylindrical lens at z={self.current_z*1e3:.1f}mm:")
@@ -939,8 +1341,9 @@ Beam Quality:
         print(f"  Number of Zernike terms: {len(self.zernike_coeffs)}")
         print(f"  Wavefront RMS: {phase_rms_nm:.1f} nm")
         
-        # Apply phase to current field
-        self.current_field = self.current_field * np.exp(1j * phase_aberration)
+        # Apply phase to current field (ensure compatible arrays)
+        field_cpu = to_cpu(self.current_field)
+        self.current_field = field_cpu * np.exp(1j * phase_aberration)
         
         print(f"  ✓ Aberrations applied")
     
